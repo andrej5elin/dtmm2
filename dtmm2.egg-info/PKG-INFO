@@ -1,0 +1,14 @@
+Metadata-Version: 2.1
+Name: dtmm2
+Version: 0.1.0
+Summary: Diffractive Transfer Matrix Method
+Home-page: https://github.com/IJSComplexMatter/dtmm
+Author: Andrej Petelin
+Author-email: andrej.petelin@gmail.com
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Description-Content-Type: text/markdown
+
+
+dtmm2 is an electro-magnetic field transmission and reflection calculation engine and visualizer. It can be used for calculation of transmission or reflection properties of layered homogeneous or inhomogeneous materials, such as confined liquid-crystals with homogeneous or inhomogeneous director profile. DTMM stands for Diffractive Transfer Matrix Method and is an adapted Berreman 4x4 transfer matrix method and an adapted 2x2 extended Jones method.
