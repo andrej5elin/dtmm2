@@ -1390,7 +1390,7 @@ def system_mat(cmat = None,fmatin = None, fmatout = None, fmatini = None, out = 
         return dotmm(fmatini,fmatout,out = out)
 
 
-def reflection_mat(smat, out = None):
+def reflection_mat(smat, transfer = 'backward',out = None):
     """Computes a 4x4 reflection matrix.
     
     Parameters
@@ -1403,11 +1403,19 @@ def reflection_mat(smat, out = None):
     m1 = np.zeros_like(smat)
     m2 = np.zeros_like(smat)
     #fill diagonals
-    for i in range(smat.shape[-1]//2):
-        m1[...,i*2+1,i*2+1] = 1.
-        m2[...,i*2,i*2] = -1.
-    m1[...,:,0::2] = -smat[...,:,0::2]
-    m2[...,:,1::2] = smat[...,:,1::2]
+    if transfer == 'backward':
+        for i in range(smat.shape[-1]//2):
+            m1[...,i*2+1,i*2+1] = 1.
+            m2[...,i*2,i*2] = -1.
+        m1[...,:,0::2] = -smat[...,:,0::2]
+        m2[...,:,1::2] = smat[...,:,1::2]
+    elif transfer == 'forward':
+        for i in range(smat.shape[-1]//2):
+            m1[...,i*2,i*2] = 1.
+            m2[...,i*2+1,i*2+1] = -1.   
+        m1[...,:,1::2] = -smat[...,:,1::2]
+        m2[...,:,0::2] = smat[...,:,0::2]
+            
     m1 = inv(m1)
     out = dotmm(m1,m2, out = out)
     return out
@@ -1515,7 +1523,7 @@ def E2fvec(evec, fmat = None, mode = +1, out = None):
 #     hout = dotmv(e2h, eout, out = fvecout[...,1::2])
 #     return fvecout
 
-def reflect(fvecin, rmat, fmatin = None, fmatout = None, fmatini = None, fmatouti = None, fvecout = None, gvec = None):
+def reflect(fvecin, rmat, fmatin = None, fmatout = None, fmatini = None, fmatouti = None, fvecout = None, gvecin = None, gvecout = None):
     """Reflects/Transmits field vector using 4x4 reflection matrix.
     
     This functions takes a field vector that describes the input field and
@@ -1570,11 +1578,17 @@ def reflect(fvecin, rmat, fmatin = None, fmatout = None, fmatini = None, fmatout
     a[...,0::2] = avec[...,0::2]
     avec = a.copy()#so that it broadcasts
 
-    if gvec is not None:
-        gvec = dotmv(fmatini,gvec)
+    if gvecin is not None:
+        gvecin = dotmv(fmatini,gvecin)
 
-    if gvec is not None:
-        a[...,0::2] -= gvec[...,0::2]
+    if gvecout is not None:
+        gvecout = dotmv(fmatouti,gvecout)
+
+    if gvecin is not None:
+        a[...,0::2] -= gvecin[...,0::2]
+
+    if gvecout is not None:
+        a[...,1::2] -= gvecout[...,1::2]
         
     if fvecout is not None:
         bvec = dotmv(fmatouti,fvecout)
@@ -1587,8 +1601,11 @@ def reflect(fvecin, rmat, fmatin = None, fmatout = None, fmatini = None, fmatout
     avec[...,1::2] = out[...,1::2]
     bvec[...,::2] = out[...,::2]
     
-    if gvec is not None:
-        avec[...,1::2] += gvec[...,1::2]
+    if gvecin is not None:
+        avec[...,1::2] += gvecin[...,1::2]
+
+    if gvecout is not None:
+        avec[...,::2] += gvecout[...,::2]
         
     dotmv(fmatin,avec,out = fvecin)    
     return dotmv(fmatout,bvec,out = out)
