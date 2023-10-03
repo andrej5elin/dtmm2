@@ -6,6 +6,7 @@ from __future__ import absolute_import, print_function, division
 from dtmm2.conf import NCDTYPE, NFDTYPE, NUMBA_TARGET,NUMBA_PARALLEL, NUMBA_CACHE, NUMBA_FASTMATH, CDTYPE, FDTYPE
 from numba import njit, prange, guvectorize, boolean
 import numpy as np
+from dtmm2.conf import deprecation
 
 if not NUMBA_PARALLEL:
     prange = range
@@ -458,8 +459,10 @@ def _inv2x2(src, dst):
     dst[1, 0] = -c * det
     dst[1, 1] =  a * det
 
+
 @njit([NCDTYPE[:,:](NCDTYPE[:,:],NCDTYPE[:,:])], cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
 def _inv4x4(src,dst):
+    """inverse 4x4 matrix, dst can be src for inplace transform"""
     
     #calculate pairs for first 8 elements (cofactors)
     tmp0 = src[2,2] * src[3,3]
@@ -475,15 +478,15 @@ def _inv4x4(src,dst):
     tmp10 = src[0,2] * src[1,3]
     tmp11 = src[1,2] * src[0,3]
     # calculate first 8 elements (cofactors)
-    dst[0,0] = tmp0*src[1,1] + tmp3*src[2,1] + tmp4*src[3,1] -tmp1*src[1,1] - tmp2*src[2,1] - tmp5*src[3,1]
-    dst[0,1] = tmp1*src[0,1] + tmp6*src[2,1] + tmp9*src[3,1] - tmp0*src[0,1] - tmp7*src[2,1] - tmp8*src[3,1]
-    dst[0,2] = tmp2*src[0,1] + tmp7*src[1,1] + tmp10*src[3,1] - tmp3*src[0,1] - tmp6*src[1,1] - tmp11*src[3,1]
-    dst[0,3] = tmp5*src[0,1] + tmp8*src[1,1] + tmp11*src[2,1] - tmp4*src[0,1] - tmp9*src[1,1] - tmp10*src[2,1]
+    dst00 = tmp0*src[1,1] + tmp3*src[2,1] + tmp4*src[3,1] -tmp1*src[1,1] - tmp2*src[2,1] - tmp5*src[3,1]
+    dst01 = tmp1*src[0,1] + tmp6*src[2,1] + tmp9*src[3,1] - tmp0*src[0,1] - tmp7*src[2,1] - tmp8*src[3,1]
+    dst02 = tmp2*src[0,1] + tmp7*src[1,1] + tmp10*src[3,1] - tmp3*src[0,1] - tmp6*src[1,1] - tmp11*src[3,1]
+    dst03 = tmp5*src[0,1] + tmp8*src[1,1] + tmp11*src[2,1] - tmp4*src[0,1] - tmp9*src[1,1] - tmp10*src[2,1]
     
-    dst[1,0] = tmp1*src[1,0] + tmp2*src[2,0] + tmp5*src[3,0] - tmp0*src[1,0] - tmp3*src[2,0] - tmp4*src[3,0]
-    dst[1,1] = tmp0*src[0,0] + tmp7*src[2,0] + tmp8*src[3,0] - tmp1*src[0,0] - tmp6*src[2,0] - tmp9*src[3,0]
-    dst[1,2] = tmp3*src[0,0] + tmp6*src[1,0] + tmp11*src[3,0] - tmp2*src[0,0] - tmp7*src[1,0] - tmp10*src[3,0]
-    dst[1,3] = tmp4*src[0,0] + tmp9*src[1,0] + tmp10*src[2,0] - tmp5*src[0,0] - tmp8*src[1,0] - tmp11*src[2,0]
+    dst10 = tmp1*src[1,0] + tmp2*src[2,0] + tmp5*src[3,0] - tmp0*src[1,0] - tmp3*src[2,0] - tmp4*src[3,0]
+    dst11 = tmp0*src[0,0] + tmp7*src[2,0] + tmp8*src[3,0] - tmp1*src[0,0] - tmp6*src[2,0] - tmp9*src[3,0]
+    dst12 = tmp3*src[0,0] + tmp6*src[1,0] + tmp11*src[3,0] - tmp2*src[0,0] - tmp7*src[1,0] - tmp10*src[3,0]
+    dst13 = tmp4*src[0,0] + tmp9*src[1,0] + tmp10*src[2,0] - tmp5*src[0,0] - tmp8*src[1,0] - tmp11*src[2,0]
     # calculate pairs for second 8 elements (cofactors) 
     tmp0 = src[2,0]*src[3,1]
     tmp1 = src[3,0]*src[2,1]
@@ -498,31 +501,50 @@ def _inv4x4(src,dst):
     tmp10 = src[0,0]*src[1,1]
     tmp11 = src[1,0]*src[0,1]
 
-    dst[2,0] = tmp0*src[1,3] + tmp3*src[2,3] + tmp4*src[3,3] - (tmp1*src[1,3] + tmp2*src[2,3] + tmp5*src[3,3])
-    dst[2,1] = tmp1*src[0,3] + tmp6*src[2,3] + tmp9*src[3,3] - (tmp0*src[0,3] + tmp7*src[2,3] + tmp8*src[3,3])
-    dst[2,2] = tmp2*src[0,3] + tmp7*src[1,3] + tmp10*src[3,3] - (tmp3*src[0,3] + tmp6*src[1,3] + tmp11*src[3,3])
-    dst[2,3] = tmp5*src[0,3] + tmp8*src[1,3] + tmp11*src[2,3] - (tmp4*src[0,3] + tmp9*src[1,3] + tmp10*src[2,3])
-    dst[3,0] = tmp2*src[2,2] + tmp5*src[3,2] + tmp1*src[1,2] - (tmp4*src[3,2] + tmp0*src[1,2] + tmp3*src[2,2])
-    dst[3,1] = tmp8*src[3,2] + tmp0*src[0,2] + tmp7*src[2,2] - (tmp6*src[2,2] + tmp9*src[3,2] + tmp1*src[0,2])
-    dst[3,2] = tmp6*src[1,2] + tmp11*src[3,2] + tmp3*src[0,2] - (tmp10*src[3,2] + tmp2*src[0,2] + tmp7*src[1,2])
-    dst[3,3] = tmp10*src[2,2] + tmp4*src[0,2] + tmp9*src[1,2] - (tmp8*src[1,2] + tmp11*src[2,2] + tmp5*src[0,2])
+    dst20 = tmp0*src[1,3] + tmp3*src[2,3] + tmp4*src[3,3] - (tmp1*src[1,3] + tmp2*src[2,3] + tmp5*src[3,3])
+    dst21 = tmp1*src[0,3] + tmp6*src[2,3] + tmp9*src[3,3] - (tmp0*src[0,3] + tmp7*src[2,3] + tmp8*src[3,3])
+    dst22 = tmp2*src[0,3] + tmp7*src[1,3] + tmp10*src[3,3] - (tmp3*src[0,3] + tmp6*src[1,3] + tmp11*src[3,3])
+    dst23 = tmp5*src[0,3] + tmp8*src[1,3] + tmp11*src[2,3] - (tmp4*src[0,3] + tmp9*src[1,3] + tmp10*src[2,3])
+    dst30 = tmp2*src[2,2] + tmp5*src[3,2] + tmp1*src[1,2] - (tmp4*src[3,2] + tmp0*src[1,2] + tmp3*src[2,2])
+    dst31 = tmp8*src[3,2] + tmp0*src[0,2] + tmp7*src[2,2] - (tmp6*src[2,2] + tmp9*src[3,2] + tmp1*src[0,2])
+    dst32 = tmp6*src[1,2] + tmp11*src[3,2] + tmp3*src[0,2] - (tmp10*src[3,2] + tmp2*src[0,2] + tmp7*src[1,2])
+    dst33 = tmp10*src[2,2] + tmp4*src[0,2] + tmp9*src[1,2] - (tmp8*src[1,2] + tmp11*src[2,2] + tmp5*src[0,2])
+    
+    
     #/* calculate determinant */
-    det=src[0,0]*dst[0,0]+src[1,0]*dst[0,1]+src[2,0]*dst[0,2]+src[3,0]*dst[0,3]
+    det=src[0,0]*dst00+src[1,0]*dst01+src[2,0]*dst02+src[3,0]*dst03
     #/* calculate matrix inverse */
     if det == 0:
         det = 0.
     else:
         det = 1./det
-    for i in range(4):
-        for j in range(4):
-            dst[i,j] = dst[i,j]*det
-            
+    
+    dst[0,0] = dst00 * det
+    dst[0,1] = dst01 * det
+    dst[0,2] = dst02 * det
+    dst[0,3] = dst03 * det
+
+    dst[1,0] = dst10 * det
+    dst[1,1] = dst11 * det
+    dst[1,2] = dst12 * det
+    dst[1,3] = dst13 * det
+    
+    dst[2,0] = dst20 * det
+    dst[2,1] = dst21 * det
+    dst[2,2] = dst22 * det
+    dst[2,3] = dst23 * det
+    
+    dst[3,0] = dst30 * det
+    dst[3,1] = dst31 * det
+    dst[3,2] = dst32 * det
+    dst[3,3] = dst33 * det
+        
     return dst
 
 
 @guvectorize([(NCDTYPE[:,:], NCDTYPE[:,:])], '(n,n)->(n,n)', target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
 def inv_numba(mat, out):
-    """inv(mat), gufunc
+    """inv_numba(mat), gufunc
     
     Calculates inverse of a 4x4 complex matrix or 2x2 complex matrix
     
@@ -552,6 +574,29 @@ def inv_numba(mat, out):
         out[...] = inv
         
 def inv(mat, out = None, method = "auto"):
+    """inv(mat), gufunc
+    
+    Calculates inverse of a complex matrix. It uses an analytical algorithm for 
+    2x2 and 4x4 shapes. It also works for general shape, but it takes a numerical
+    approach calling np.linalg.inv function.
+    
+    Parameters
+    ----------
+    mat : ndarray
+       Input array
+    
+    Examples
+    --------
+    
+    >>> a = np.random.randn(4,4) + 0j
+    >>> ai = inv(a)
+    
+    >>> from numpy.linalg import inv
+    >>> ai2 = inv(a)
+    
+    >>> np.allclose(ai2,ai)
+    True
+    """
     mat = np.asarray(mat)
     if method == 'numba' or (method == 'auto' and mat.shape[-1] in (2,4)):
         return inv_numba(mat, out)
@@ -604,6 +649,7 @@ def _dotmm4(a,b,out):
     out[3,1] = d1
     out[3,2] = d2
     out[3,3] = d3 
+
     
 @njit([(NCDTYPE[:,:],NCDTYPE[:,:],NCDTYPE[:,:])], cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)    
 def _dotmm2(a,b,out):
@@ -619,9 +665,6 @@ def _dotmm2(a,b,out):
     out[1,0] = b0
     out[1,1] = b1
     
-# @njit([(NCDTYPE[:,::1],NCDTYPE[:,::1],NCDTYPE[:,::1])], cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)    
-# def _dotmm(a,b,out):
-#     np.dot(a,b, out)
  
 @njit([(NCDTYPE[:,:],NCDTYPE[:,:],NCDTYPE[:,:])], cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)    
 def _dotmm(a,b,out):
@@ -754,6 +797,13 @@ def _dotmv4(a, b, out):
     out[1]= out1
     out[2]= out2
     out[3]= out3
+    
+@njit([(NCDTYPE[:,:],NCDTYPE[:],NCDTYPE[:])], cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
+def _dotmv24(a, b, out):
+    out0 = a[0,0] * b[0] + a[0,1] * b[1] + a[0,2] * b[2] +a[0,3] * b[3]
+    out1 = a[1,0] * b[0] + a[1,1] * b[1] + a[1,2] * b[2] +a[1,3] * b[3]
+    out[0]= out0
+    out[1]= out1
     
 @njit([(NCDTYPE[:,:],NCDTYPE[:],NCDTYPE[:])], cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
 def _dotmv2(a, b, out):
@@ -1073,7 +1123,7 @@ def dotmm_numba(a, b, out):
 Computes an efficient dot product of a 4x4,  2x2 
 or a less efficient general matrix multiplication.
 """
-    if a.shape[0] == 2 and  a.shape[1] == 2:
+    if a.shape[0] == 2 and a.shape[1] == 2:
         _dotmm2(a, b, out)
     elif a.shape[0] == 4 and a.shape[1] == 4:
         _dotmm4(a, b, out)
@@ -1272,18 +1322,21 @@ matrix represented by a vector of shape 4 (or 2).
          assert a.shape[0] >= 4 #make sure it is not smaller than 4
          _dotmd4(a, d, out)
 
-@guvectorize([(NCDTYPE[:,:],NCDTYPE[:],NCDTYPE[:])],"(n,n),(n)->(n)",target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
+@guvectorize([(NCDTYPE[:,:],NCDTYPE[:],NCDTYPE[:])],"(n,m),(m)->(n)",target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
 def dotmv(a, b, out):
     """dotmv(a, b)
     
-Computes a dot product of a matrix of shape (n,n) and vector of shape (n,).  
+Computes a dot product of a matrix of shape (n,m) and vector of shape (m,).  
 """
-    if a.shape[0] == 2:
+    if a.shape[0] == 2 and a.shape[1] == 2:
         _dotmv2(a, b, out)
-    elif a.shape[0] == 4:
+    elif a.shape[0] == 4 and a.shape[1] == 4:
         assert a.shape[0] >= 4 #make sure it is not smaller than 4
         _dotmv4(a, b, out)
+    elif a.shape[0] == 2 and a.shape[1] == 4:
+        _dotmv24(a, b, out)
     else:
+        #general matrix/vector product
         _dotmv(a, b, out)
     
 @guvectorize([(NCDTYPE[:,:],NCDTYPE[:],NCDTYPE[:,:],NCDTYPE[:,:])],"(n,n),(n),(n,n)->(n,n)",target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
@@ -1292,8 +1345,17 @@ def dotmdm(a, d, b, out):
     
 Computes a dot product of a 4x4 (or 2x2) matrix with a diagonal matrix (4- or 2-vector) 
 and another 4x4 (or 2x2) matrix.
+
+Take care when performing inplace transform.
+
+The function performs dotmd(a,d,out) and then dotmm(out,b,out)
+Therefore, care must be made when setting the output array so that you do not 
+overwrite data during the conversion.
+
+dotmdm(a,d,b, out = b) will not give correct result. 
+dotmdm(a,d,b, out = a) is safe on the other hand.
 """
-    #assert a.shape[0] >= 4 #make sure it is not smaller than 4 
+  
     if a.shape[0] == 2:
         _dotmd2(a, d, out)
         _dotmm2(out,b,out)
@@ -1328,10 +1390,15 @@ def multi_dot_old(arrays,  axis = 0, reverse = False):
                 out = dotmm(out, arrays[i])
     return out
 
-def multi_dot(arrays,  axis = 0, reverse = False):
+def multi_dot(arrays,  axis = 0, reverse = None, transfer = "backward"):
     """Computes dot product of multiple 2x2 or 4x4 matrices. If reverse is 
     specified, it is performed in reversed order. Axis defines the axis over 
     which matrices are multiplied."""
+    if reverse is not None:
+        deprecation("reverse is deprecated, use transfer argument instead")
+    if transfer not in ("backward", "forward"):
+        raise ValueError("Invalid transfer direction")
+    
     out = None
     if axis != 0:
         arrays = np.asarray(arrays)
@@ -1345,9 +1412,14 @@ def multi_dot(arrays,  axis = 0, reverse = False):
         else:
             b = np.broadcast(out, a)
             if b.shape == out.shape:
-                out = dotmm(out, a, out = out)
+                _out = out 
             else:
-                out = dotmm(out, a)
+                _out = None
+            if transfer == "backward":
+                out = dotmm(out, a, out = _out)
+            else:
+                out = dotmm(a,out, out = _out)
+                    
     return out
 
 def dotchi2v(a, v):
@@ -1371,6 +1443,8 @@ def dotchi2v(a, v):
     out[...,:,1] += t2[...,:,3]*v[...,None,2]
     out[...,:,2] += t2[...,:,2]*v[...,None,2]
     return out
+
+
 
     
     

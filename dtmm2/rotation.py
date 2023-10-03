@@ -282,14 +282,50 @@ def rotate_diagonal_tensor(R,diagonal,out = None):
 
 
         
+# @jit([NCDTYPE[:](NFDTYPE[:,:],NCDTYPE[:],NCDTYPE[:])],nopython = True, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
+# def _rotate_diagonal_tensor(R,diagonal,out):
+#     """Calculates out = R.diagonal.RT of a diagonal tensor"""
+#     for i in range(3):
+#         out[i] = diagonal[0]*R[i,0]*R[i,0] + diagonal[1]*R[i,1]*R[i,1] + diagonal[2]*R[i,2]*R[i,2]
+#     out[3] = diagonal[0]*R[0,0]*R[1,0] + diagonal[1]*R[0,1]*R[1,1] + diagonal[2]*R[0,2]*R[1,2]
+#     out[4] = diagonal[0]*R[0,0]*R[2,0] + diagonal[1]*R[0,1]*R[2,1] + diagonal[2]*R[0,2]*R[2,2]          
+#     out[5] = diagonal[0]*R[1,0]*R[2,0] + diagonal[1]*R[1,1]*R[2,1] + diagonal[2]*R[1,2]*R[2,2]
+#     return out
+
 @jit([NCDTYPE[:](NFDTYPE[:,:],NCDTYPE[:],NCDTYPE[:])],nopython = True, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
-def _rotate_diagonal_tensor(R,diagonal,out):
+def _rotate_diagonal_tensor(R,tensor,out):
     """Calculates out = R.diagonal.RT of a diagonal tensor"""
-    for i in range(3):
-        out[i] = diagonal[0]*R[i,0]*R[i,0] + diagonal[1]*R[i,1]*R[i,1] + diagonal[2]*R[i,2]*R[i,2]
-    out[3] = diagonal[0]*R[0,0]*R[1,0] + diagonal[1]*R[0,1]*R[1,1] + diagonal[2]*R[0,2]*R[1,2]
-    out[4] = diagonal[0]*R[0,0]*R[2,0] + diagonal[1]*R[0,1]*R[2,1] + diagonal[2]*R[0,2]*R[2,2]          
-    out[5] = diagonal[0]*R[1,0]*R[2,0] + diagonal[1]*R[1,1]*R[2,1] + diagonal[2]*R[1,2]*R[2,2]
+
+    #copy in case we are reusing output memory
+    r11 = R[0,0]
+    r12 = R[0,1]
+    r13 = R[0,2]
+    r21 = R[1,0]
+    r22 = R[1,1]
+    r23 = R[1,2]
+    r31 = R[2,0]
+    r32 = R[2,1]
+    r33 = R[2,2]
+    t1 = tensor[0]
+    t2 = tensor[1]
+    t3 = tensor[2]   
+    
+    a1 = (r11 * t1)
+    a2 = (r13 * t3)
+    a3 = (r12 * t2)
+    
+    out[0] = r11 * a1 + r13 * a2 + r12 * a3 
+    out[3] = r21 * a1 + r23 * a2 + r22 * a3  
+    out[4] = r31 * a1 + r33 * a2 + r32 * a3 
+    
+    a1 = r21 * t1 
+    a2 = r23 * t3  
+    a3 = r22 * t2 
+    
+    out[1] =  r21 * a1 + r23 * a2 + r22 * a3
+    out[5] =  r31 * a1 + r33 * a2 + r32 * a3
+    
+    out[2] = r31 * (r31 * t1) + r33 * (r33 * t3 ) + r32 * (r32 * t2 )
     return out
 
 

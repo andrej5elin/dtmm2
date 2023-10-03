@@ -24,7 +24,8 @@ Field vector creation/conversion functions
 Field matrix functions
 ++++++++++++++++++++++
 
-* :func:`.f_iso` for input and output field matrix calculation.
+* :func:`.fmat` for general field matrix.
+* :func:`.f_iso` for isotropic input and output field matrix.
 * :func:`.ffi_iso` besides field matrix, computes also the inverse of the field matrix. 
 * :func:`.alphaf` for general field vectors and field coefficents calculation (eigensystem calculation). 
 * :func:`.alphaffi` computes also the inverse of the field matrix.
@@ -61,20 +62,33 @@ from __future__ import absolute_import, print_function, division
 
 import numpy as np
 
-from dtmm2.conf import NCDTYPE,NFDTYPE, CDTYPE, FDTYPE, NUMBA_TARGET, \
+from dtmm2.conf import NCDTYPE,NFDTYPE, NUDTYPE, CDTYPE, FDTYPE, NUMBA_TARGET, \
                         NUMBA_PARALLEL, NUMBA_CACHE, NUMBA_FASTMATH, DTMMConfig, deprecation
 from dtmm2.rotation import  _calc_rotations_uniaxial, _calc_rotations, _rotate_diagonal_tensor, _rotate_tensor
 from dtmm2.linalg import _dotr2m, dotmdm, dotmm, inv, dotmv, _dotr2v
 from dtmm2.data import refind2eps
-from dtmm2.rotation import rotation_vector2
+from dtmm2.rotation import rotation_vector2, rotation_matrix, rotate_tensor, rotate_diagonal_tensor
 from dtmm2.print_tools import print_progress
+
+import dtmm2.rotation as rotation
 
 import numba as nb
 from numba import prange
 import time
 
+# free space impedance
+Z0 = 376.73031366857 
+
 if NUMBA_PARALLEL == False:
     prange = range
+
+FIELD_EIG_METHOD = "auto"
+
+AVAILABLE_FIELD_EIG_METHODS = {"auto" : 0,
+                               "isotropic" : 1,
+                               "uniaxial" : 2,
+                               "biaxial" : 3,
+                               "general" : 4}
 
 sqrt = np.sqrt
 
@@ -129,18 +143,27 @@ def _auxiliary_matrix(beta,eps,Lm):
 def _auxiliary_matrix_vec(beta,eps,dummy,Lm):
     """Computes all elements of the auxiliary matrix of shape 4x4."""
     assert len(eps) == 6
+    
+    #conpy in case we are reusing eps memory for output
+    eps0 = eps[0]
+    eps1 = eps[1]
+    eps2 = eps[2]
+    eps3 = eps[3]
+    eps4 = eps[4]
+    eps5 = eps[5]
+    
     beta = beta[0]
-    eps2m = 1./eps[2]
-    eps4eps2m = eps[4]*eps2m
-    eps5eps2m = eps[5]*eps2m
+    eps2m = 1./eps2
+    eps4eps2m = eps4*eps2m
+    eps5eps2m = eps5*eps2m
     
     Lm[0,0] = (-beta*eps4eps2m)
     Lm[0,1] = 1.-beta*beta*eps2m
     Lm[0,2] = (-beta*eps5eps2m)
     Lm[0,3] = 0.
-    Lm[1,0] = eps[0]- eps[4]*eps4eps2m
+    Lm[1,0] = eps0- eps4*eps4eps2m
     Lm[1,1] = Lm[0,0]
-    Lm[1,2] = eps[3]- eps[5]*eps4eps2m
+    Lm[1,2] = eps3- eps5*eps4eps2m
     Lm[1,3] = 0.
     Lm[2,0] = 0.
     Lm[2,1] = 0.
@@ -148,12 +171,14 @@ def _auxiliary_matrix_vec(beta,eps,dummy,Lm):
     Lm[2,3] = -1. 
     Lm[3,0] = (-1.0*Lm[1,2])
     Lm[3,1] = (-1.0*Lm[0,2])
-    Lm[3,2] = beta * beta + eps[5]*eps5eps2m - eps[1]  
+    Lm[3,2] = beta * beta + eps5*eps5eps2m - eps1 
     Lm[3,3] = 0.  
-    
-    
-def auxiliary_matrix(eps, beta = 0, out = None):
-    return _auxiliary_matrix_vec(beta,eps,_dummy_array,out)
+      
+def auxiliary_matrix(beta = None, epsilon = None, out = None):
+    """Computes auxiliary matrix in refraction plane"""
+    beta, phi = _default_beta_phi(beta,None)
+    epsilon = _default_epsilon(epsilon)
+    return _auxiliary_matrix_vec(beta,epsilon,_dummy_array,out)
     
 
 @nb.njit([(NFDTYPE,NCDTYPE[:],NCDTYPE[:],NCDTYPE[:,:])], cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
@@ -188,6 +213,13 @@ def _alphaf_iso(beta,eps0,alpha,F):
         
         F[...]=0.
         alpha[...] = 0.
+        
+@nb.njit([NFDTYPE(NCDTYPE[:])], cache = NUMBA_CACHE)
+def _poynting(field):
+    """Computes poynting vector from the field vector"""
+    tmp1 = (field[0].real * field[1].real + field[0].imag * field[1].imag)
+    tmp2 = (field[2].real * field[3].real + field[2].imag * field[3].imag)
+    return (tmp1-tmp2)
 
 @nb.njit([(NFDTYPE,NCDTYPE[:],NFDTYPE[:,:],NCDTYPE[:],NCDTYPE[:,:])], cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
 def _alphaf_uniaxial(beta,eps0,R,alpha,F): 
@@ -205,7 +237,7 @@ def _alphaf_uniaxial(beta,eps0,R,alpha,F):
 
     
     delta = eps0[2] -  eps11
-    if beta == 0.: #same as calculation for beta !=0, except faster... no multiplying with zeros
+    if beta == 0. : #same as calculation for beta !=0, except faster... no multiplying with zeros
         ev02 =  eps11 
         evs = sqrt(ev02)
         u = eps11 + delta * ct2
@@ -237,7 +269,19 @@ def _alphaf_uniaxial(beta,eps0,R,alpha,F):
 
 
     if beta == 0.:
-
+        # we must hanlde the beta = 0 case because in case st = 0, we get invalid
+        # eigenvectors.
+        if st == 0.: 
+            # this is the only combination that yields degenerate case for any
+            # phi angle. Therefore, in order to preserve proper eigenvalue sorting
+            # we must enforce the phi = 0 here, so sf=0 and cf=1 to return the
+            # solution bound to the eigenframe of the material.
+            sf = 0.
+            cf = 1.
+        
+        # compared to beta !=0 case, we do not have dependence on st here.
+        # the eigenvectors are only a function of the phi angle.
+        
         eps11sf = eps11 * sf
         evssf = evs*sf
         evscf = evs*cf
@@ -264,6 +308,7 @@ def _alphaf_uniaxial(beta,eps0,R,alpha,F):
         F[3,1] = -evpm *sf    
         
     else:
+        # general case
         sfst = (R[1,2])
         cfst = (R[0,2])                   
                                     
@@ -303,20 +348,15 @@ def _alphaf_uniaxial(beta,eps0,R,alpha,F):
             tmp += F[i,j].real * F[i,j].real + F[i,j].imag * F[i,j].imag
         
         tmp = (tmp) ** 0.5
-        F[0,j] = F[0,j]/tmp 
-        F[1,j] = F[1,j]/tmp 
-        F[2,j] = F[2,j]/tmp 
-        F[3,j] = F[3,j]/tmp 
         
+        #tmp = _poynting(F[:,j])
+        if tmp != 0:
+            F[0,j] = F[0,j]/tmp 
+            F[1,j] = F[1,j]/tmp 
+            F[2,j] = F[2,j]/tmp 
+            F[3,j] = F[3,j]/tmp 
+            
         
-
-@nb.njit([NFDTYPE(NCDTYPE[:])], cache = NUMBA_CACHE)
-def _poynting(field):
-    """Computes poynting vector from the field vector"""
-    tmp1 = (field[0].real * field[1].real + field[0].imag * field[1].imag)
-    tmp2 = (field[2].real * field[3].real + field[2].imag * field[3].imag)
-    return (tmp1-tmp2) 
-
 @nb.njit([(NCDTYPE[:],NCDTYPE[:,:],NCDTYPE[:],NCDTYPE[:,:])], cache = NUMBA_CACHE)
 def _copy_sorted(alpha,fmat, out_alpha, out_fmat):
     """Eigen modes sorting based on the computed poynting vector direction"""
@@ -343,62 +383,194 @@ def _copy_sorted(alpha,fmat, out_alpha, out_fmat):
                 out_fmat[:,j] = fmat[:,k]
             j = j + 2
     if ok == False:
-        print("Could not sort eigenvectors! Proceed with caution!")
+        print("Could not sort eigenvectors! Setting the field matrix eigenvectors to zero, and eigenvalue to np.nan!")
         for i in range(4):
             #indicate that something went wrong, and that sorting was unsucesful
             out_alpha[i] = np.nan
             out_fmat[:,i] = 0
-            
-            
-@nb.guvectorize([(NFDTYPE[:],NFDTYPE[:],NFDTYPE[:],NCDTYPE[:],NFDTYPE[:],NCDTYPE[:],NCDTYPE[:],NCDTYPE[:,:])],
-                 "(),(),(m),(l),(k),(n)->(n),(n,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
-def _alphaf_vec(beta,phi,rv,epsv,epsa,dummy,alpha,F):
+
+@nb.guvectorize([(NCDTYPE[:],NCDTYPE[:,:],NCDTYPE[:],NCDTYPE[:,:])],
+                 "(n),(n,n)->(n),(n,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)            
+def _copy_sorted_vec(alpha,fmat, out_alpha, out_fmat):
+    alpha = alpha.copy()# need to copy for inplace conversion
+    fmat = fmat.copy()# need to copy for inplace conversion
+    _copy_sorted(alpha,fmat, out_alpha, out_fmat)
+                    
+@nb.guvectorize([(NUDTYPE[:],NFDTYPE[:],NFDTYPE[:],NFDTYPE[:],NCDTYPE[:],NFDTYPE[:],NCDTYPE[:],NCDTYPE[:],NCDTYPE[:,:])],
+                 "(),(),(),(m),(l),(k),(n)->(n),(n,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
+def _alphaf_vec(case,beta,phi,rv,epsv,epsa,dummy,alpha,F):
     """eigenvalue solver. Depending on the material parameter
     we choose isotropic, uniaxial  or a biaxial solver.
     
     Becaue the auxiliary matrix is written in the rotated frame (in the plane of incidence with phi = 0)
     We need to rotate the computed vectors using _dotr2m 
     """
-    #F is a 4x4 matrix... we can use 3x3 part for Rotation matrix and F[3] for eps  temporary data
+    CASE = case[0]
     
-    if len(epsv) == 6:
-        #determine if we need to work with full tensor. 
-        if epsv[3] != 0 or epsv[4] != 0 or epsv[5] != 0:
-            #one of off-diagonal elements is not zero. We take the general approach
-            R = F.real 
-            eps = F.ravel() #reuse F memory (eps is length 6 1D array)
-            _calc_rotations(phi[0],epsa,R) #store rotation matrix in Fi.real[0:3,0:3]
-            _rotate_tensor(R,epsv,eps)
-            _auxiliary_matrix(beta[0],eps,F) #calculate Lm matrix and put it to F
-            alpha0,F0 = np.linalg.eig(F)
-            _copy_sorted(alpha0,F0,alpha,F)#copy data and sort it
-            _dotr2m(rv,F,F)            
-
+    # auto determine CASE
+    if CASE == 0:
+        if len(epsv) == 6 and (epsv[3] != 0 or epsv[4] != 0 or epsv[5] != 0):
+            # in case we use 6 component tensor, and at least one offdiagonal is not zero
+            # we must treat the sample as a biaxial
+            CASE = 4 # biaxial with off-diag epsilon
+        elif (epsv[0] == epsv[1]):
+            if epsv[1]==epsv[2]:
+                CASE = 1 #isotropic
+            else:
+                CASE = 2 #uniaxial
+        else:
+            CASE = 3 #biaxial with diagonal eps
+            
+    #F is a 4x4 matrix... we can use 3x3 part for Rotation matrix and F[3] for eps  temporary data
+            
     #isotropic case
-    if (epsv[0] == epsv[1] and epsv[1]==epsv[2]):
-        eps = F[3] 
+    if CASE == 1:
         _alphaf_iso(beta[0],epsv,alpha,F)
         _dotr2m(rv,F,F)
     #uniaxial
-    elif (epsv[0] == epsv[1]):
+    elif CASE == 2:
         R = F.real
-        eps = F[3] 
         _calc_rotations_uniaxial(phi[0],epsa,R) #store rotation matrix in Fi.real[0:3,0:3]
         _alphaf_uniaxial(beta[0],epsv,R,alpha,F)
         _dotr2m(rv,F,F)
-    else:#biaxial case
+    else:#biaxial case or 6-component
         R = F.real 
         eps = F.ravel() #reuse F memory (eps is length 6 1D array)
         _calc_rotations(phi[0],epsa,R) #store rotation matrix in Fi.real[0:3,0:3]
-        _rotate_diagonal_tensor(R,epsv,eps)
+        if CASE == 3:
+            _rotate_diagonal_tensor(R,epsv,eps)
+        else: #CASE 0, we must rotate full 6-component tensor
+            assert len(epsv) >= 6
+            _rotate_tensor(R,epsv,eps)
         _auxiliary_matrix(beta[0],eps,F) #calculate Lm matrix and put it to F
         alpha0,F0 = np.linalg.eig(F)
         _copy_sorted(alpha0,F0,alpha,F)#copy data and sort it
         _dotr2m(rv,F,F)
         
+
+@nb.guvectorize([(NUDTYPE[:],NFDTYPE[:],NFDTYPE[:],NFDTYPE[:],NCDTYPE[:],NFDTYPE[:],NCDTYPE[:,:],NCDTYPE[:],NCDTYPE[:,:],NCDTYPE[:,:])],
+                 "(),(),(),(m),(l),(k),(m,n)->(n),(n,n),(m,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
+def _alphafhe_vec(case,beta,phi,rv,epsv,epsa,dummy,alpha,F,HE):
+    """eigenvalue solver. Depending on the material parameter
+    we choose isotropic, uniaxial  or a biaxial solver.
+    
+    Becaue the auxiliary matrix is written in the rotated frame (in the plane of incidence with phi = 0)
+    We need to rotate the computed vectors using _dotr2m 
+    """
+    CASE = case[0]
+    #F is a 4x4 matrix... we can use 3x3 part for Rotation matrix and F[3] for eps  temporary data
+    if CASE == 0:
+        if len(epsv) == 6 and (epsv[3] != 0 or epsv[4] != 0 or epsv[5] != 0):
+            # in case we use 6 component tensor, and at least one offdiagonal is not zero
+            # we must treat the sample as a biaxial
+            CASE = 4 # biaxial with off-diag epsilon
+        elif (epsv[0] == epsv[1]):
+            if epsv[1]==epsv[2]:
+                CASE = 1 #isotropic
+            else:
+                CASE = 2 #uniaxial
+        else:
+            CASE = 3 #biaxial with diagonal eps
+            
+    #isotropic case
+    if CASE == 1:
+        eps = F[3] 
+        _alphaf_iso(beta[0],epsv,alpha,F)
+        _dotr2m(rv,F,F)
+    #uniaxial
+    elif CASE == 2:
+        R = F.real
+        eps = F[3] 
+        _calc_rotations_uniaxial(phi[0],epsa,R) #store rotation matrix in Fi.real[0:3,0:3]
+        _alphaf_uniaxial(beta[0],epsv,R,alpha,F)
+        _dotr2m(rv,F,F)
+    else:#biaxial case or 6-component
+        R = F.real 
+        eps = F.ravel() #reuse F memory (eps is length 6 1D array)
+        _calc_rotations(phi[0],epsa,R) #store rotation matrix in Fi.real[0:3,0:3]
+        if CASE == 3:
+            _rotate_diagonal_tensor(R,epsv,eps)
+        else: #CASE 0, we must rotate full 6-component tensor
+            assert len(epsv) >= 6
+            _rotate_tensor(R,epsv,eps)
+        _auxiliary_matrix(beta[0],eps,F) #calculate Lm matrix and put it to F
+        alpha0,F0 = np.linalg.eig(F)
+        _copy_sorted(alpha0,F0,alpha,F)#copy data and sort it
+        _dotr2m(rv,F,F)
+        
+    e0 = -eps[4]/eps[2] #eps_zx/eps_zz
+    e1 = -beta[0]/eps[2] #eps_zx/eps_zz
+    e2 = -eps[5]/eps[2] #eps_zy/eps_zz
+    
+    HE[0,0] = beta[0] * rv[0]
+    HE[0,1] = 0
+    HE[0,2] = -beta[0] * rv[1]
+    HE[0,3] = 0
+    
+    HE[1,0] = e0 * rv[0] - e2 * rv[1]
+    HE[1,1] = e1* rv[0]
+    HE[1,2] = -e0 * rv[1] + e2 * rv[0]
+    HE[1,3] = -e1* rv[1]
+    
+        
+@nb.guvectorize([(NFDTYPE[:],NFDTYPE[:],NFDTYPE[:],NCDTYPE[:],NFDTYPE[:],NCDTYPE[:,:],NCDTYPE[:,:])],
+                 "(),(),(m),(l),(k),(m,n)->(m,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
+def _he_vec(beta,phi,rv,epsv,epsa,dummy,out):
+    """eigenvalue solver. Depending on the material parameter
+    we choose isotropic, uniaxial  or a biaxial solver.
+    
+    Becaue the auxiliary matrix is written in the rotated frame (in the plane of incidence with phi = 0)
+    We need to rotate the computed vectors using _dotr2m 
+    """
+    R = np.empty(shape = (3,3), dtype = rv.dtype)
+    
+    if len(epsv) == 6 and (epsv[3] != 0 or epsv[4] != 0 or epsv[5] != 0):
+        # in case we use 6 component tensor, and at least one offdiagonal is not zero
+        # we must treat the sample as a biaxial
+        CASE = 0 # biaxial with off-diag epsilon
+    elif (epsv[0] == epsv[1]):
+        if epsv[1]==epsv[2]:
+            CASE = 1 #isotropic
+        else:
+            CASE = 2 #uniaxial
+    else:
+        CASE = 3 #biaxial with diagonal eps
+                    
+    #isotropic or uniaxial case
+    if CASE == 1 or CASE == 2:
+        _calc_rotations_uniaxial(phi[0],epsa,R) #store rotation matrix in Fi.real[0:3,0:3]
+    else:#biaxial case or 6-component
+        _calc_rotations(phi[0],epsa,R)
+        
+    eps = out.ravel() #reuse F memory (eps is length 6 1D array)
+
+    if CASE == 0: #CASE 0, we must rotate full 6-component tensor
+        _rotate_tensor(R,epsv,eps)
+    else: 
+        _rotate_diagonal_tensor(R,epsv,eps)
+        
+    e0 = -eps[4]/eps[2] #eps_zx/eps_zz
+    e1 = -beta[0]/eps[2] #eps_zx/eps_zz
+    e2 = -eps[5]/eps[2] #eps_zy/eps_zz
+    
+    out[0,0] = beta[0] * rv[0]
+    out[0,1] = 0
+    out[0,2] = -beta[0] * rv[1]
+    out[0,3] = 0
+    
+    out[1,0] = e0 * rv[0] - e2 * rv[1]
+    out[1,1] = e1* rv[0]
+    out[1,2] = -e0 * rv[1] + e2 * rv[0]
+    out[1,3] = -e1* rv[1]
+        
+
+        
 #dummy arrays for gufuncs    
 _dummy_array = np.empty((4,),CDTYPE)
-_dummy_array2 = np.empty((9,),CDTYPE)
+_dummy_array4 = _dummy_array
+_dummy_array6 = np.empty((6,),CDTYPE)
+_dummy_array24 = np.empty((2,4),CDTYPE)
+#_dummy_array2 = np.empty((9,),CDTYPE)
 _dummy_EH = np.empty((2,),CDTYPE)
     
 
@@ -420,6 +592,12 @@ def _default_epsv_epsa(epsv, epsa):
     assert epsa.shape[-1] >= 3
     return epsv, epsa
 
+def _default_epsilon(epsilon):
+    """Checks the validity of epsilon argument and sets default values if needed"""
+    epsilon = np.asarray(epsilon, CDTYPE) if epsilon is not None else np.asarray((1.,1.,1.,0.,0.,0.), CDTYPE)
+    assert epsilon.shape[-1] >= 6
+    return epsilon
+
 def _as_field_vec(fvec):
     """converts input to valid field vector"""
     fvec = np.asarray(fvec, dtype = CDTYPE)
@@ -431,7 +609,19 @@ def _as_field_vec(fvec):
 
 FORCEPSV = {'factor' : 1} 
 
-def alphaf(beta = None, phi = None, epsv = None, epsa = None, out = None):
+def eig(m, normalize = False):
+    """same as np.linalg.eig. For 4x4 matrix it also performs pynting vector 
+    eigenvector sorting. Optionally, normalizes the vectors to unit intensity"""
+    alpha,F = np.linalg.eig(m)
+    if F.shape[-1] == 4:
+        alpha,F = _copy_sorted_vec(alpha,F,out = (alpha,F))
+        if normalize == True:
+            F = normalize_f(F,out = F)
+        return alpha, F
+    else:
+        return alpha, F
+
+def field_eig(epsilon = None, angles = None, beta = None, phi = None,  normalize = True, out = None):
     """Computes alpha and field arrays (eigen values and eigen vectors arrays).
     
     Broadcasting rules apply.
@@ -442,10 +632,12 @@ def alphaf(beta = None, phi = None, epsv = None, epsa = None, out = None):
         The beta parameter of the field (defaults to 0.)
     phi : float, optional
         The phi parameter of the field (defaults to 0.)
-    epsv : (...,3) array, optional
-        Dielectric tensor eigenvalues array (defaults to unity).
-    epsa : (...,3) array, optional
-        Euler rotation angles (psi, theta, phi) (defaults to (0.,0.,0.)).
+    epsilon : (...,3) array or (..., 6) array, optional
+        Dielectric tensor eigenvalues array (defaults to unity), or full dielectric
+        tensor array (diagonal and off-diagonal values)
+    angles : (...,3) array, optional
+        Euler rotation angles (psi, theta, phi) (defaults to (0.,0.,0.)) for 
+        rotation of the epsilon tensor to laboratory frame.
     out : (ndarray,ndarray), optional
         Output arrays.
        
@@ -454,60 +646,57 @@ def alphaf(beta = None, phi = None, epsv = None, epsa = None, out = None):
     alpha, fieldmat: (ndarray, ndarray)
         Eigen values and eigen vectors arrays. 
     """
+    
     beta, phi = _default_beta_phi(beta,phi)
-    epsv, epsa = _default_epsv_epsa(epsv, epsa)
-    rv = rotation_vector2(phi) 
+    epsv, epsa = _default_epsv_epsa(epsilon, angles)
+    rv = rotation_vector2(phi)
+    case = AVAILABLE_FIELD_EIG_METHODS[FIELD_EIG_METHOD]
     if out is None:
-        out = _alphaf_vec(beta,phi,rv,epsv,epsa,_dummy_array)
+        out = _alphaf_vec(case,beta,phi,rv,epsv,epsa,_dummy_array)
     else:
-        1/0
-        out = _alphaf_vec(beta,phi,rv,epsv,epsa,_dummy_array, out = out)
+        out = _alphaf_vec(case,beta,phi,rv,epsv,epsa,_dummy_array, out = out)
         
-    if FORCEPSV['factor'] != 1:
-        epsveff = (epsv[...,0] + epsv[...,1] + epsv[...,2])/3
-        delta = (epsv[...,0] - epsveff) * FORCEPSV['factor']
+    # if out is None:
+    #     out = _alphaf_vec(beta,phi,rv,epsv,epsa,_dummy_array)
+    # else:
+    #     1/0
+    #     out = _alphaf_vec(beta,phi,rv,epsv,epsa,_dummy_array, out = out)
         
-        epsv = epsv.copy()
-        epsv[...,0] = epsveff + delta
-        epsv[...,1] = epsveff + delta
-        epsv[...,2] = epsveff - 2*delta
+    # # if FORCEPSV['factor'] != 1:
+    # #     epsveff = (epsv[...,0] + epsv[...,1] + epsv[...,2])/3
+    # #     delta = (epsv[...,0] - epsveff) * FORCEPSV['factor']
+        
+    # #     epsv = epsv.copy()
+    # #     epsv[...,0] = epsveff + delta
+    # #     epsv[...,1] = epsveff + delta
+    # #     epsv[...,2] = epsveff - 2*delta
                    
 
         
-        _, f =_alphaf_vec(beta,phi,rv,epsv,epsa,_dummy_array)
-        out = out[0], f
+    #     _, f =_alphaf_vec(beta,phi,rv,epsv,epsa,_dummy_array)
+    #     out = out[0], f
+    if normalize:
+        normalize_f(out[1],out[1])
     return out
 
-def f(beta = None, phi = None, epsv = None, epsa = None):
-    """Computes field arrays ( eigen vectors arrays).
-    
-    Broadcasting rules apply.
-    
-    Parameters
-    ----------
-    beta : float, optional
-        The beta parameter of the field (defaults to 0.)
-    phi : float, optional
-        The phi parameter of the field (defaults to 0.)
-    epsv : (...,3) array, optional
-        Dielectric tensor eigenvalues array (defaults to unity).
-    epsa : (...,3) array, optional
-        Euler rotation angles (psi, theta, phi) (defaults to (0.,0.,0.)).
-       
-    Returns
-    -------
-    fieldmat: ndarray
-        Eigen vectors arrays. 
-    """
-    alpha, f = alphaf(beta,phi,epsv,epsa)
-    return f
+def he_eig(epsilon = None, angles = None, beta = None, phi = None,  normalize = False,  out = None):
+    """Same as field_eig, but returns also a result of hzez_mat"""
+    beta, phi = _default_beta_phi(beta,phi)
+    epsv, epsa = _default_epsv_epsa(epsilon, angles)
+    rv = rotation_vector2(phi)  
+    case = AVAILABLE_FIELD_EIG_METHODS[FIELD_EIG_METHOD]
+    if out is None:
+        out = _alphafhe_vec(case, beta,phi,rv,epsv,epsa,_dummy_array24)
+    else:
+        out = _alphafhe_vec(case, beta,phi,rv,epsv,epsa,_dummy_array24, out = out)
+        
+    if normalize:
+        normalize_f(out[1],out[1])
+    return out
 
-#alias 
-fmat = f
-
-def alphaffi(beta=None,phi=None,epsv=None,epsa=None,out = None):
+def field_eigi(epsilon = None, angles = None, beta=None, phi=None, normalize = False, out = None):
     """Computes alpha and field arrays (eigen values and eigen vectors arrays)
-    and inverse of the field array. See also :func:`alphaf` 
+    and inverse of the field array. See also :func:`field_eig` 
     
     Broadcasting rules apply.
     
@@ -517,9 +706,10 @@ def alphaffi(beta=None,phi=None,epsv=None,epsa=None,out = None):
         The beta parameter of the field (defaults to 0.)
     phi : float, optional
         The phi parameter of the field (defaults to 0.)
-    epsv : (...,3) array, optional
-        Dielectric tensor eigenvalues array (defaults to unity).
-    epsa : (...,3) array, optional
+    epsilon : (...,3) array or (..., 6) array, optional
+        Dielectric tensor eigenvalues array (defaults to unity), or full dielectric
+        tensor array (diagonal and off-diagonal values)
+    angles : (...,3) array, optional
         Euler rotation angles (psi, theta, phi) (defaults to (0.,0.,0.)).
     out : (ndarray,ndarray,ndarray), optional
         Output arrays.
@@ -539,12 +729,54 @@ def alphaffi(beta=None,phi=None,epsv=None,epsa=None,out = None):
     """
     if out is not None:
         a,f,fi = out
-        alphaf(beta,phi,epsv,epsa, out = (a,f))
+        field_eig(epsilon,angles,beta, phi, out = (a,f), normalize = normalize)
         inv(f,fi)
     else:
-        a,f = alphaf(beta,phi,epsv,epsa)
+        a,f = field_eig(epsilon,angles, beta, phi, normalize = normalize)
         fi = inv(f)
     return a,f,fi
+
+# for backward compatibility
+def alphaf(beta = None, phi = None, epsv = None, epsa = None, out = None):
+    deprecation("Deprecated, use field_eig instead.")
+    return field_eig(epsv,epsa,beta,phi, out = out)
+
+def alphaffi(beta = None, phi = None, epsv = None, epsa = None, out = None):
+    deprecation("Deprecated, use field_eig instead.")
+    return field_eigi(epsv,epsa,beta,phi, out = out)
+
+def field_mat(epsilon = None, angles = None, beta = None, phi = None, normalize = True, **kwargs):
+    """Computes field arrays ( eigen vectors arrays).
+    
+    Broadcasting rules apply.
+    
+    Parameters
+    ----------
+    beta : float, optional
+        The beta parameter of the field (defaults to 0.)
+    phi : float, optional
+        The phi parameter of the field (defaults to 0.)
+    epsilon : (...,3) array or (..., 6) array, optional
+        Dielectric tensor eigenvalues array (defaults to unity), or full dielectric
+        tensor array (diagonal and off-diagonal values)
+    angles : (...,3) array, optional
+        Euler rotation angles (psi, theta, phi) (defaults to (0.,0.,0.)).
+       
+    Returns
+    -------
+    fieldmat: ndarray
+        Eigen vectors arrays. 
+    """
+    alpha, f = field_eig(epsilon,angles,beta, phi, normalize = normalize)
+    return f
+
+def fmat(beta = None, phi = None, epsv = None, epsa = None):
+    deprecation("Please use field_mat instead")
+    return field_mat(epsv,epsa,beta,phi)
+
+#alias  for bacward compatibility
+f = fmat
+
 
 def alphaE(beta = None,phi = None,epsv = None,epsa = None, mode = +1, normalize_fmat = False, out = None):
     """Computes E-field eigenvalue and eigenvector matrix for the 2x2 formulation.
@@ -575,7 +807,7 @@ def alphaE(beta = None,phi = None,epsv = None,epsa = None, mode = +1, normalize_
     
     """
     mode = _mode_to_int(mode)
-    alpha,f = alphaf(beta,phi,epsv,epsa)
+    alpha,f = field_eig(epsv,epsa, beta, phi)
     if normalize_fmat == True:
         normalize_f(f,f)
     e = E_mat(f,mode = mode, copy = False)
@@ -708,6 +940,58 @@ def phase_mat(alpha, kd, mode = None,  out = None):
     #     out[...,::2] *= DELETEME[1]       
     return out 
 
+def fvec2hevec(field, epsilon = None, angles = None, beta = None, phi = None, out = None):
+    """Converts input field4 (Ex, Hy, Ey, Hx) vector to a field6 vector (Hz, Ex, Hy, Ey, Hx, Ez)"""
+    epsilon,angles = _default_epsv_epsa(epsilon, angles)
+    beta, phi = _default_beta_phi(beta, phi)
+    rv = rotation_vector2(-phi)
+    
+    return _field6(field, beta, phi, rv, epsilon,angles, _dummy_array6, out)
+
+def hevec(fvec, hzez = None):
+    if hzez is None:
+        hzez = hzez_mat()
+    if fvec.shape[-1] != 6:
+        out = np.empty(fvec.shape[:-1] + (6,), dtype = fvec.dtype)
+        out[...,1:-1] = fvec
+    else:
+        out = fvec
+    dotmv(hzez, out[...,1:-1], out[...,0::5])
+    return out
+
+def hevec2fvec(field, copy = False):
+    """Returns a view of the field4 array form the field6 array"""
+    field = np.asarray(field)
+    if field.shape[-1] != 6:
+        raise ValueError("Not a valid field6 array")
+    out = field[...,1::-1]
+    return out.copy() if copy == True else out
+
+def Evec(fvec, copy = False):
+    """Returns a view of the E field part of the total field"""
+    fvec = np.asarray(fvec)
+    if fvec.shape[-1] == 4:
+        out = fvec[...,::2]
+    elif fvec.shape[-1] == 6:
+        out = fvec[...,1::2]
+    else:
+        raise ValueError("Invalid field shape")
+        
+    return out.copy() if copy == True else out
+    
+def Hvec(fvec, copy = False):
+    """Returns a view of the H field part of the total field"""
+    fvec = np.asarray(fvec)
+    if fvec.shape[-1] == 4:
+        out = fvec[...,-1::-2]
+    elif fvec.shape[-1] == 6:
+        out = fvec[...,-2::-2]
+    else:
+        raise ValueError("Invalid field shape")
+        
+    return out.copy() if copy == True else out        
+        
+
 def iphase_mat(alpha, kd, cfact = 0.1, mode = +1,  out = None):
     """Computes incoherent 4x4 phase matrix from eigenvalue matrix alpha and wavenumber"""
     mode = _mode_to_int(mode)
@@ -758,10 +1042,10 @@ def fmat2poynting(fmat, out = None):
     axes.append(n)
     fmat = fmat.transpose(*axes)
     return poynting(fmat, out = out)
-    
+
 @nb.guvectorize([(NCDTYPE[:,:], NCDTYPE[:,:])],
                     "(n,n)->(n,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)       
-def normalize_f(fmat, out):
+def normalize_mat(fmat, out):
     """Normalizes columns of field matrix so that fmat2poytning of the resulted
     matrix returns ones
     
@@ -774,9 +1058,7 @@ def normalize_f(fmat, out):
     """
     assert fmat.shape[0] == 4 and fmat.shape[1] == 4 
     for i in range(4):
-        tmp1 = (fmat[0,i].real * fmat[1,i].real + fmat[0,i].imag * fmat[1,i].imag)
-        tmp2 = (fmat[2,i].real * fmat[3,i].real + fmat[2,i].imag * fmat[3,i].imag)
-        n = np.abs(tmp1-tmp2)**0.5 
+        n = np.abs(_poynting(fmat[:,i]))**0.5
         if n == 0.:
             n = 0.
         else:
@@ -787,6 +1069,7 @@ def normalize_f(fmat, out):
         out[3,i] = fmat[3,i] * n
 
 
+normalize_f = normalize_mat
 
 def intensity(fvec,out = None):
     """Calculates absolute value of the z-component of the poynting vector
@@ -828,9 +1111,51 @@ def projection_mat(fmat, fmati = None, mode = +1, out = None):
         diag[...,0::2] = 1.
     else:
         diag[...,1::2] = 1.   
-    return dotmdm(fmat,diag,fmati, out)    
+    return dotmdm(fmat,diag,fmati, out)   
 
-def project(fvec, fmat, fmati, mode = +1, out = None):
+# def interface_transmission_mat(fmatin = None, fmatout = None, mode = +1, out = None):
+#     if mode == +1:
+#         fmatini = inv(fmatin)
+#         #stsem matrix for transfering output field to input field
+#         smat = system_mat(fmatini = fmatini, fmatout = fmatout, transfer = "backward")
+#         tmat = np.zeros_like(smat)
+#         tmat[...,0::2,0::2] = inv(smat[...,0::2,0::2])
+#         return dotmm(fmatout,dotmm(tmat,fmatini))
+#     else:
+#         fmatouti = inv(fmatout)
+#         smat = system_mat(fmatin = fmatin, fmatouti = fmatouti, transfer = "forward")
+#         tmat = np.zeros_like(smat)
+#         tmat[...,1::2,1::2]  = inv(smat[...,1::2,1::2])
+#         return dotmm(fmatin,dotmm(tmat,fmatouti))
+
+def field_transmission_mat(rmat, fmatin = None, fmatout = None, mode = +1):
+    mode = _mode_to_int(mode)
+    if mode == +1:
+        fmatini = inv(fmatin)
+        tmat = np.zeros_like(rmat) 
+        tmat[0::2,0::2] = rmat[0::2,0::2]
+        return dotmm(fmatout,dotmm(tmat,fmatini))
+    else:
+        fmatouti = inv(fmatout)
+        tmat = np.zeros_like(rmat)
+        tmat[...,1::2,1::2]  = rmat[1::2,1::2]
+        return dotmm(fmatin,dotmm(tmat,fmatouti))       
+
+def field_reflection_mat(rmat, fmatin = None, fmatout = None, mode = +1):
+    mode = _mode_to_int(mode)
+    if mode == +1:
+        fmatini = inv(fmatin)
+        tmat = np.zeros_like(rmat) 
+        tmat[1::2,0::2] = rmat[1::2,0::2]
+        return dotmm(fmatin,dotmm(tmat,fmatini))
+    else:
+        fmatouti = inv(fmatout)
+        tmat = np.zeros_like(rmat)
+        tmat[...,0::2,1::2]  = rmat[0::2,1::2]
+        return dotmm(fmatout,dotmm(tmat,fmatouti))  
+
+
+def project(fvec, fmat, fmati = None, mode = +1, out = None):
     """Projects field vector using the given field matrix. By multiplying
     the field with the projection matrix you obtain only the forward (mode = +1) or
     backward (mode = -1) propagating field
@@ -873,8 +1198,8 @@ def EHz(fvec, beta = None, phi = None, epsv = None, epsa = None, out = None):
         
     Returns
     -------
-    Ez,Hz : (ndarray,ndarray)
-        Ez and Hz arrays of shape (...,4)
+    EHz : ndarray
+        EHz array of shape (...,2)
     """
     fvec = _as_field_vec(fvec)
     beta, phi = _default_beta_phi(beta, phi)
@@ -882,6 +1207,8 @@ def EHz(fvec, beta = None, phi = None, epsv = None, epsa = None, out = None):
     rv = rotation_vector2(-phi)
     
     return _EHz(fvec,beta,phi,rv, epsv,epsa,_dummy_EH,out)
+
+
     
 @nb.guvectorize([(NCDTYPE[:],NFDTYPE[:],NFDTYPE[:],NFDTYPE[:],NCDTYPE[:],NFDTYPE[:],NCDTYPE[:],NCDTYPE[:])],
                  "(n),(),(),(m),(l),(k),(o)->(o)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
@@ -890,10 +1217,49 @@ def _EHz(fvec, beta,phi,rv,epsv,epsa,dummy,out):
     R = np.empty(shape = (3,3), dtype = rv.dtype)
     frot = np.empty_like(fvec)
     _dotr2v(rv,fvec,frot)
+    
     _calc_rotations_uniaxial(phi[0],epsa,R)
     _rotate_diagonal_tensor(R,epsv,eps)
     out[0] = - (eps[4]*frot[0] + eps[5]*frot[2] + beta[0] * frot[1]) / eps[2]
-    out[1] = beta[0] * frot[3]
+    out[1] = beta[0] * frot[2]
+
+
+
+@nb.guvectorize([(NCDTYPE[:],NFDTYPE[:],NFDTYPE[:],NFDTYPE[:],NCDTYPE[:],NFDTYPE[:],NCDTYPE[:],NCDTYPE[:])],
+                 "(n),(),(),(m),(l),(k),(o)->(o)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
+def _field6(fvec, beta,phi,rv,epsv,epsa,dummy,out):
+    """Converts field4 to field6"""
+    if len(epsv) == 6 and (epsv[3] != 0 or epsv[4] != 0 or epsv[5] != 0):
+        # in case we use 6 component tensor, and at least one offdiagonal is not zero
+        # we must treat the sample as a biaxial
+        CASE = 0 # biaxial with off-diag epsilon
+    elif (epsv[0] == epsv[1]):
+        if epsv[1]==epsv[2]:
+            CASE = 1 #isotropic
+        else:
+            CASE = 2 #uniaxial
+    else:
+        CASE = 3 #biaxial with diagonal eps
+    
+    eps = np.empty(shape = (6,), dtype = epsv.dtype)
+    R = np.empty(shape = (3,3), dtype = rv.dtype)
+    frot = np.empty_like(fvec)
+    _dotr2v(rv,fvec,frot)
+    if CASE == 1 or CASE == 2:
+        _calc_rotations_uniaxial(phi[0],epsa,R)
+    else:
+        _calc_rotations(phi[0],epsa,R)
+    if CASE == 0:
+        _rotate_tensor(R,epsv,eps)
+    else:  
+        _rotate_diagonal_tensor(R,epsv,eps)
+    out[0] = beta[0] * frot[2]
+    out[1] = fvec[0]
+    out[2] = fvec[1]
+    out[3] = fvec[2]
+    out[4] = fvec[3]   
+    out[5] = - (eps[4]*frot[0] + eps[5]*frot[2] + beta[0] * frot[1]) / eps[2]
+
 
 
 def T_mat(fmatin, fmatout, fmatini = None, fmatouti = None, mode = +1):
@@ -959,6 +1325,7 @@ def S_mat(fmatin, fmatout, fmatini = None, overwrite_fmatin = False, mode = +1):
         return S[...,::2,::2],S[...,1::2,0::2]
     else:
         return S[...,1::2,1::2],S[...,0::2,1::2]
+
 
 # def transmission_mat(fmatin, fmatout, fmatini = None, mode = +1,out = None):
 #     """Computes the transmission matrix.
@@ -1172,7 +1539,7 @@ def f_iso(beta = 0., phi = 0., n = 1.):
     """
     epsv = refind2eps([n]*3)
     epsa = np.zeros(shape = (3,),dtype= FDTYPE)
-    alpha, f = alphaf(beta,phi,epsv,epsa)    
+    alpha, f = field_eig(epsv,epsa, beta, phi)    
     return f
 
 def ffi_iso(beta=0.,phi = 0., n=1):
@@ -1193,10 +1560,311 @@ def ffi_iso(beta=0.,phi = 0., n=1):
     """
     epsv = refind2eps([n]*3)
     epsa = np.zeros(shape = (3,),dtype= FDTYPE)
-    alpha, f, fi = alphaffi(beta,phi,epsv,epsa)    
+    alpha, f, fi = field_eigi(epsv,epsa, beta,phi)    
     return f,fi
 
-def layer_mat(kd, epsv,epsa, beta = 0,phi = 0, cfact = 0.1, method = "4x4", fmatin = None, retfmat = False, out = None):
+    
+
+
+class TransferMatrix1D():
+    def __init__(self, kd = 1, epsilon = None, angles = None, beta = None, phi = None):
+        self._kd = np.asarray(kd)
+        self._epsilon, self._angles = _default_epsv_epsa(epsilon, angles)
+        self._beta, self._phi = _default_beta_phi(beta, phi)
+        self._field_matrix = None
+        self._alpha_matrix = None
+        self._ifield_matrix = None
+        self._phase_matrix = None
+        self._transfer_matrix = None
+        self._hzez_matrix = None
+        self._rotation_matrix = None
+        
+    @property   
+    def kd(self):
+        return self._kd        
+        
+    @property   
+    def epsilon(self):
+        return self._epsilon
+
+    @property   
+    def angles(self):
+        return self._angles 
+    
+    @property   
+    def beta(self):
+        return self._beta
+
+    @property   
+    def phi(self):
+        return self._phi 
+    
+    def clear_eig(self):
+        """Clears out temporary field matrices"""
+        self._field_matrix = None
+        self._ifield_matrix = None
+        self._alpha_matrix = None
+        self._phase_matrix = None
+        
+    def clear_transfer_matrix(self):
+        """Clears transfer matrix"""
+        self._transfer_matrix = None
+        self._hzez_matrix = None
+        
+    def clear_all(self):
+        """Clears all data."""
+        self.clear_eig()
+        self.clear_transfer_matrix()
+       
+    def compute_field_eig(self, out = None):
+        """Computes eigen field matrices"""
+        out = field_eig(self.epsilon,self.angles, self.beta, self.phi, out = out)
+        self._alpha_matrix, self._field_matrix  = out
+        return out
+    
+    def compute_field_eigi(self, out = None):
+        """Computes eigen field matrices and inverse of the field matrix"""
+        out = field_eigi(self.epsilon,self.angles, self.beta, self.phi, out = out)
+        self._alpha_matrix, self._field_matrix, self._ifield_matrix = out
+        return out
+    
+    def compute_he_eig(self, out = None):
+        """Computes eigen field matrices and hzez matrix"""
+        out = he_eig(self.epsilon,self.angles, self.beta, self.phi, out = None)
+        self._alpha_matrix, self._field_matrix, self._hzez_matrix = out
+        return out
+    
+    def compute_transfer_matrix(self, with_hzez = False, out = None):
+        out = transfer_mat(self.kd, self.epsilon,self.angles, self.beta, self.phi, with_hzez = with_hzez, out = out)
+        if with_hzez == True:
+            self._transfer_matrix, self._hzez_matrix = out
+        else:
+            self._transfer_matrix = out
+        return out
+    
+    def get_epsilon_tensor(self):
+        """Returns epsilon tensor in the laboratory frame."""
+        r = rotation_matrix(self.angles)
+        if self.epsilon.shape[-1] == 3:
+            return rotate_diagonal_tensor(r,self.epsilon)  
+        else:
+            return rotate_tensor(r,self.epsilon)  
+    
+    def get_transfer_matrix(self, copy = False):
+        if self._transfer_matrix is None:
+            if self._field_matrix is None:
+                self._transfer_matrix = transfer_mat(self.kd, self.epsilon,self.angles, self.beta, self.phi)
+            else:
+                fmat = self.get_field_matrix()
+                pmat = self.get_phase_matrix()
+                ifmat = self.get_ifield_matrix()
+                self._transfer_matrix = dotmdm(fmat,pmat,ifmat)
+        out = self._transfer_matrix
+        return out if copy == False else out.copy()
+        
+    def get_field_matrix(self, copy = False):      
+        if self._field_matrix is None:
+            self.compute_field_eig()
+        out = self._field_matrix
+        return out if copy == False else out.copy()
+    
+    def get_ifield_matrix(self, copy = False):      
+        if self._ifield_matrix is None:
+            if self._field_matrix is None:
+                self.compute_field_eigi()
+        out = self._ifield_matrix
+        return out if copy == False else out.copy()            
+    
+    def get_phase_matrix(self, copy = False):
+        if self._phase_matrix is None:
+            if self._alpha_matrix is None:
+                alpha = self.get_alpha_matrix()
+                self._phase_matrix = phase_mat(alpha,self.kd)
+        out = self._phase_matrix
+        return out if copy == False else out.copy()
+    
+    def get_alpha_matrix(self, copy = False):
+        if self._alpha_matrix is None:
+            self.get_field_matrix() #will also set alpha matrix
+        out = self._alpha_matrix
+        return out if copy == False else out.copy()
+        
+    def get_hzez_matrix(self, copy = False):
+        if self._hzez_matrix is None:
+            self._hzez_matrix = hzez_mat(self.epsilon, self.angles, self.beta, self.phi)
+        out = self._hzez_matrix
+        return out if copy == False else out.copy()
+
+    def transfer_fvec(self, field, out = None):
+        mat = self.get_transfer_matrix()
+        return dotmv(mat, field, out = out)
+    
+    def transfer_hevec(self, field, out = None):
+        hzez = self.get_hzez_matrix()
+        # the inner part is fvec
+        f = field[...,1:-1].copy()
+        if out is None:
+            f = self.transfer_fvec(f)
+            return hevec(f, hzez)
+        else:
+            #take the inner part and stor into inner part
+            self.transfer_fvec(f, out = out[...,1:-1])
+            # will only update first and last component of out.
+            return hevec(out, hzez)
+        
+    def print_info(self):
+        pass
+ 
+from dtmm2.wave import mask2beta, mask2phi, eigenmask, k0
+
+def _default_beam_mask(mask, k):
+    if mask is None:
+        mask = eigenmask((128,128), k, aspect = 1.)
+    return mask
+
+ 
+def beam_eig(k, epsilon = None, angles = None, normalize = True, mask = None):
+    k = np.asarray(k)
+    epsilon, angles = _default_epsv_epsa(epsilon, angles)
+    mask = _default_beam_mask(mask, k)
+    
+    #add axis
+    epsilon = epsilon[...,None,:]
+    angles = angles[...,None,:]
+    
+    betas = mask2beta(mask,k)
+    phis = mask2phi(mask,k)
+    
+    if k.ndim == 0:
+        return field_eig(epsilon,angles, betas, phis, normalize = normalize)
+    else:
+        out = (field_eig(epsilon,angles, betas[i], phis[i], normalize = normalize) for i in range(len(k0)))
+        return tuple(out)
+        
+  
+def beam_transfer_mat(k, d, epsilon = None, angles = None, mask = None, with_hzez = False):
+    k = np.asarray(k)
+    epsilon, angles = _default_epsv_epsa(epsilon, angles)
+    mask = _default_beam_mask(mask, k)
+    
+    #add axis
+    epsilon = epsilon[...,None,:]
+    angles = angles[...,None,:]
+    
+    betas = mask2beta(mask,k)
+    phis = mask2phi(mask,k)
+    
+    if k.ndim == 0:
+        return transfer_mat(k*d,epsilon,angles, betas, phis, with_hzez = with_hzez)
+    else:
+        out = (transfer_mat(k[i]*d,epsilon,angles, betas[i], phis[i], with_hzez = with_hzez) for i in range(len(k0)))
+        return tuple(out)
+
+def transfer_beam(mat, beam, hzez = None, out = None):
+    if isinstance(mat, tuple):
+        if hzez is None:
+            hzez = [None] * len(mat)
+        if out is None:
+            out = [None] * len(mat)
+        return tuple((transfer_beam(m,b,h,o) for m, b, h, o in zip(mat,beam,hzez,out)) )
+    return transfer_wave(mat, beam, hzez, out)
+    
+def transfer_wave(mat, wave, hzez = None, out = None):
+    wave = np.asarray(wave)
+    if wave.shape[-1] == 4:
+        return dotmv(mat, wave, out)
+    elif wave.shape[-1] == 6:
+        fvec = wave[...,1:-1]
+        if out is None:
+            fvec = transfer_wave(fvec)
+            return hevec(fvec, hzez)
+        else:
+            #take the inner part and stor into inner part
+            transfer_wave(fvec, out = out[...,1:-1])
+            # will only update first and last component of out.
+            return hevec(out, hzez)
+    
+def transfer_mat(kd, epsilon = None, angles = None, beta = None, phi = None, with_hzez = False, out = None):
+    """Computes berreman transfer matrix of a single layer M=F.P.Fi,
+    
+    Numpy broadcasting rules apply.
+    
+    Parameters
+    ----------
+    kd : float
+        The kd phase value (layer thickness times wavenumber in vacuum). For 
+        forward transform it is a positive number, while for backward trasnform
+        set it as a negative number.
+    epsilon : (...,3) array or (..., 6) array, optional
+        Dielectric tensor eigenvalues array (defaults to unity), or full dielectric
+        tensor array (diagonal and off-diagonal values)
+    angles : (...,3) array, optional
+        Euler rotation angles (psi, theta, phi) (defaults to (0.,0.,0.)).
+    beta : float, optional
+        The beta parameter of the field (defaults to 0.)
+    phi : float, optional
+        The phi parameter of the field (defaults to 0.)
+    cfact : float, optional
+        Coherence factor, only used in combination with `4x4_2` method.
+    method : str
+        One of 4x4 (4x4 berreman - trasnmittance + reflectance), 
+        2x2 (2x2 jones - transmittance only), 
+        4x4_1 (4x4, single reflections - transmittance only),
+        2x2_1 (2x2, single reflections - transmittance only) 
+        4x4_2 (4x4, partially coherent reflections - transmittance only) 
+    fmatin : ndarray, optional
+        Used in combination with 2x2_1 method. It specifies the field matrix of 
+        the input media in order to compute fresnel reflections. If not provided 
+        it reverts to 2x2 with no reflections.
+        
+    out : ndarray, optional
+    
+    Returns
+    -------
+    cmat : ndarray
+        Characteristic matrix of the layer.
+    """
+
+    epsilon, angles = _default_epsv_epsa(epsilon, angles)
+    beta, phi = _default_beta_phi(beta, phi)
+    
+    if with_hzez == True:
+        if out is None:
+            alpha,fmat,hzez = he_eig(epsilon, angles, beta, phi)
+        else:
+            alpha = np.empty(out.shape[:-1], out.dtype)
+            _out1,_out2 = out
+            _out = alpha, _out1, _out2 
+            alpha,fmat,hzez = he_eig(epsilon, angles, beta, phi, out = _out)
+        fmati = inv(fmat)
+    else:
+        alpha,fmat,fmati = field_eigi(epsilon, angles, beta, phi)
+
+    pmat = phase_mat(alpha,kd, out = alpha)
+    
+    if with_hzez == True:
+        if out is None:
+            return dotmdm(fmat,pmat, fmati, out = fmat), hzez 
+        else:
+            return dotmdm(fmat,pmat, fmati, out = _out1), hzez
+    else:
+        #we can overwrite fmat during dotmdm, but not fmati! 
+        out = fmat if out is None else out
+        return dotmdm(fmat,pmat, fmati, out = out)
+        
+ 
+def hzez_mat(epsilon = None, angles = None, beta = None, phi = None, out = None):
+    """Constructs a 2x4 matrix for conversion from field vector (Ex, Hy, Ey, Hx) 
+    to Hz,Ez vector"""
+    
+    epsilon, angles = _default_epsv_epsa(epsilon, angles)
+    beta, phi = _default_beta_phi(beta, phi)
+    # we mast rotate back to reference frame, so -phi (equivalent to transpose rotation matrix)
+    rv = rotation_vector2(phi) 
+    return _he_vec(beta,phi,rv,epsilon,angles,_dummy_array24, out = out)
+        
+    
+def layer_mat(kd, epsv = None, epsa = None, beta = 0,phi = 0, cfact = 0.1, method = "4x4", fmatin = None, retfmat = False, out = None):
     """Computes characteristic matrix of a single layer M=F.P.Fi,
     
     Numpy broadcasting rules apply.
@@ -1205,8 +1873,9 @@ def layer_mat(kd, epsv,epsa, beta = 0,phi = 0, cfact = 0.1, method = "4x4", fmat
     ----------
     kd : float
         The kd phase value (layer thickness times wavenumber in vacuum).
-    epsv : (...,3) array, optional
-        Dielectric tensor eigenvalues array (defaults to unity).
+    epsv : (...,3) array or (..., 6) array, optional
+        Dielectric tensor eigenvalues array (defaults to unity), or full dielectric
+        tensor array (diagonal and off-diagonal values)
     epsa : (...,3) array, optional
         Euler rotation angles (psi, theta, phi) (defaults to (0.,0.,0.)).
     beta : float, optional
@@ -1234,7 +1903,7 @@ def layer_mat(kd, epsv,epsa, beta = 0,phi = 0, cfact = 0.1, method = "4x4", fmat
         Characteristic matrix of the layer.
     """    
     if method in ("2x2","2x2_1"):
-        alpha,fmat = alphaf(beta,phi,epsv,epsa)
+        alpha,fmat = field_eig(epsv,epsa, beta, phi)
         f = E_mat(fmat, mode = +1, copy = False)
         if fmatin is not None and method == "2x2_1":
             fi = Eti_mat(fmatin, fmat, mode = +1)
@@ -1243,7 +1912,7 @@ def layer_mat(kd, epsv,epsa, beta = 0,phi = 0, cfact = 0.1, method = "4x4", fmat
         pmat = phase_mat(alpha[...,::2],kd)
 
     elif method in ("4x4","4x4_1","4x4_2"):
-        alpha,fmat,fi = alphaffi(beta,phi,epsv,epsa)
+        alpha,fmat,fi = field_eigi(epsv,epsa, beta, phi)
         fmat = normalize_f(fmat)
         fi = inv(fmat)
         f = fmat
@@ -1349,8 +2018,10 @@ _m0 = np.array([[1.,0,0,0,0,0,0,0],
                [0,0,1,0,0,0,0,0],
                [0,0,0,0,0,0,0,1]])    
     
-def system_mat(cmat = None,fmatin = None, fmatout = None, fmatini = None, out = None):
-    """Computes a system matrix from a characteristic matrix Fin-1.C.Fout
+def system_mat(cmat = None,fmatin = None, fmatout = None, fmatini = None, fmatouti = None, transfer = "backward", out = None):
+    """Computes a system matrix from a characteristic matrix. 
+    For backward transfer it does Fin-1.C.Fout
+    For forward transfer it does Fout-1.C.Fin
     
     Parameters
     ----------
@@ -1365,12 +2036,21 @@ def system_mat(cmat = None,fmatin = None, fmatout = None, fmatini = None, out = 
     out : ndarray, optional
         Output array where results are written.
     """
+    if transfer == "forward":
+        #matrices roles are reversed
+        fmatin, fmatini, fmatout, fmatouti = fmatout, fmatouti, fmatin ,fmatini
+    elif transfer != "backward":
+        raise ValueError("Unknown transfer direction.")
+    
     if fmatini is None:
         if fmatin is None:
             fmatin = f_iso()
         fmatini = inv(fmatin)
     if fmatout is None:
-        fmatout = fmatin
+        if fmatouti is not None:
+            fmatout = inv(fmatouti)
+        else:
+            fmatout = fmatin
     if cmat is not None:
         if cmat.shape[-1] == 8:
             dotmm(fmatini,cmat[...,0:4,0:4],out = cmat[...,0:4,0:4])
@@ -1397,6 +2077,9 @@ def reflection_mat(smat, transfer = 'backward',out = None):
     ----------
     smat : (...,4,4) array
         System matrix.
+    transfer: str
+        Either 'backward' or 'forward', specifying the direction in which
+        the system matrix transfers the field vector.
     out : ndarray, optional
         Output array where results are written.
     """
@@ -1409,13 +2092,17 @@ def reflection_mat(smat, transfer = 'backward',out = None):
             m2[...,i*2,i*2] = -1.
         m1[...,:,0::2] = -smat[...,:,0::2]
         m2[...,:,1::2] = smat[...,:,1::2]
-    elif transfer == 'forward':
+
+    elif transfer ==  'forward':
         for i in range(smat.shape[-1]//2):
             m1[...,i*2,i*2] = 1.
             m2[...,i*2+1,i*2+1] = -1.   
         m1[...,:,1::2] = -smat[...,:,1::2]
         m2[...,:,0::2] = smat[...,:,0::2]
-            
+
+    else:
+        raise ValueError('Uknown transfer direction')
+        
     m1 = inv(m1)
     out = dotmm(m1,m2, out = out)
     return out
@@ -1491,7 +2178,6 @@ def E2fvec(evec, fmat = None, mode = +1, out = None):
 #     fvecin : (...,4) array
 #         Input field vector array. This function will update the input array  
 #         with the calculated reflected field.
-#     cmat : (...,4,4) array
 #         Characteristic matrix.
 #     fmatout : (...,4,4) array
 #         Output field matrix array.
@@ -1523,6 +2209,246 @@ def E2fvec(evec, fmat = None, mode = +1, out = None):
 #     hout = dotmv(e2h, eout, out = fvecout[...,1::2])
 #     return fvecout
 
+def avec2svec(avecin, avecout = None, out = None):
+    """Converts an amplitude vector(s) to a scattering vector.
+    
+    Parameters
+    ----------
+    avecin : ndarray
+        The amplitude vector on the input size
+    avecout : ndarray, optional
+        The amplitude vector on the output size. Defaults to zeros.
+    out : ndarray, optional
+        The output array.
+    """
+    if out is None:
+        out = np.empty_like(avecin)
+    out[...,0::2] = avecin[...,0::2]
+    if avecout is not None:
+        out[...,1::2] = avecout[...,1::2]
+    else:
+        out[...,1::2] = 0.
+    return out
+
+def svec2avec(svec, avecin = None, avecout = None):
+    """Converts a scattering vector to input,output amplitude vectors
+    
+    Parameters
+    ----------
+    svec : ndarray
+        A scattering vector
+    avecin : ndarray, optional
+        Amplitude vector on the input size. The refelcted part of the smat will
+        be set to this vector (the transmitted part will remain intact).
+    avecout : ndarray, optional
+        Amplitude vector on the output size. The transmitted part of the smat will
+        be set to this vector (the reflected part will remain intact).
+    
+    Returns
+    -------
+    out : ndarray, ndarray
+        A tuple of input and ouptut amplitude vectors.
+    
+    """
+    if avecin is None:
+        avecin = np.zeros_like(svec)
+    if avecout is None:
+        avecout = np.zeros_like(svec)
+    avecin[...,1::2] = svec[...,1::2]
+    avecout[...,0::2] = svec[...,0::2]
+    return avecin, avecout
+
+def reflect_svec(svec, rmat, out = None):
+    b = np.broadcast(svec[..., None],rmat[...,0:4,0:4])
+    
+    if svec.shape != b.shape[:-1]:
+        raise ValueError("Input field vector should have shape of {}".format(b.shape[:-1]))
+    
+    svec = np.broadcast_to(svec, b.shape[:-1])
+    return dotmv(rmat, svec, out = out)
+
+def reflect_avec(avecin, rmat, avecout = None, gvecin = None, gvecout = None, out_type = "full"):
+    """Reflects/Transmits amplitude vector using 4x4 reflection matrix.
+    
+    This functions takes a field vector that describes the input field and
+    computes the output transmited field and also updates the input field 
+    with the reflected waves.
+   
+    Parameters
+    ----------
+    avecin : (...,4) array
+        Input amplitude vector array. This function will update the input array  
+        with the calculated reflected field
+    rmat : (...,4,4) array
+        Reflection matrix.
+    avecout : (...,4) array, optional
+        The ouptut amplitude vector array. This function will update the output array 
+        with the calculated transmitted field.
+    gvecin : (...,4) array, optional
+        Specifies the amplitude gain vector at the input side. 
+    gvecout : (...,4) array, optional
+        Specifies the amplitude gain vector at the output side. 
+    
+    """
+    svec = avec2svec(avecin, avecout)
+    svec = reflect_svec(svec, rmat)
+    
+    if out_type == "full":
+        avecin, avecout = svec2avec(svec, avecin, avecout)
+    else:
+        avecin, avecout = svec2avec(svec)
+
+    
+    b = np.broadcast(avecin[..., None],rmat[...,0:4,0:4])
+    
+    if avecin.shape != b.shape[:-1]:
+        raise ValueError("Input field vector should have shape of {}".format(b.shape[:-1]))
+     
+    avecin = np.broadcast_to(avecin, )
+
+        
+    avec = avecin
+    bvec = avecout
+    
+    a = np.zeros(b.shape[:-1], avec.dtype)
+    a[...,0::2] = avec[...,0::2]
+    avec = a.copy()#so that it broadcasts
+
+    if gvecin is not None:
+        a[...,0::2] -= gvecin[...,0::2]
+        
+    if avecout is not None:
+        a[...,1::2] = bvec[...,1::2] 
+    else:
+        bvec = np.zeros_like(avec)
+        
+    if gvecout is not None:
+        a[...,1::2] -= gvecout[...,1::2]
+        
+
+    out = dotmv(rmat,a, out = a)
+    
+    if gvecin is not None:
+        out[...,1::2] += gvecin[...,1::2]
+
+    if gvecout is not None:
+        out[...,0::2] += gvecout[...,0::2]
+        
+    return out
+        
+    avecin[...,1::2] = out[...,1::2]
+    bvec[...,::2] = out[...,::2]
+        
+    return bvec
+
+def reflect_avec(avecin, rmat, avecout = None, gvecin = None, gvecout = None):
+    """Reflects/Transmits amplitude vector using 4x4 reflection matrix.
+    
+    This functions takes a field vector that describes the input field and
+    computes the output transmited field and also updates the input field 
+    with the reflected waves.
+   
+    Parameters
+    ----------
+    avecin : (...,4) array
+        Input amplitude vector array. This function will update the input array  
+        with the calculated reflected field
+    rmat : (...,4,4) array
+        Reflection matrix.
+    avecout : (...,4) array, optional
+        The ouptut amplitude vector array. This function will update the output array 
+        with the calculated transmitted field.
+    gvecin : (...,4) array, optional
+        Specifies the amplitude gain vector at the input side. 
+    gvecout : (...,4) array, optional
+        Specifies the amplitude gain vector at the output side. 
+    """
+    b = np.broadcast(avecin[..., None],rmat[...,0:4,0:4])
+    
+    if avecin.shape != b.shape[:-1]:
+        raise ValueError("Input field vector should have shape of {}".format(b.shape[:-1]))
+      
+    
+    out = transmit_avec(avecin,rmat,avecout,gvecin,gvecout)
+    
+    avecin[...,1::2] = out[...,1::2]
+    if avecout is None:
+        avecout = np.zeros_like(out)
+    avecout[...,::2] = out[...,::2]
+        
+    return avecout
+    
+
+def reflect_fvec(fvecin, rmat, fmatin = None, fmatout = None, fmatini = None, fmatouti = None, fvecout = None, gvecin = None, gvecout = None):
+    """Reflects/Transmits field vector using 4x4 reflection matrix.
+    
+    This functions takes a field vector that describes the input field and
+    computes the output transmited field and also updates the input field 
+    with the reflected waves.
+   
+    Parameters
+    ----------
+    fvecin : (...,4) array
+        Input field vector array. This function will update the input array  
+        with the calculated reflected field
+    rmat : (...,4,4) array
+        Reflection matrix.
+    fmatin : (...,4,4) array
+        Input field matrix array.
+    fmatout : (...,4,4) array
+        Output field matrix array.
+    fmatini : (...,4,4) array
+        Inverse of the input field matrix array.
+    fmatouti : (...,4,4) array, optional
+        Inverse of the output field matrix array. If not provided, it is computed
+        from `fmatout`.
+    fvecout : (...,4) array, optional
+        The ouptut field vector array. This function will update the output array 
+        with the calculated transmitted field.
+    gvecin : (...,4) array, optional
+        Specifies the field gain vector at the input side. 
+    gvecout : (...,4) array, optional
+        Specifies the field gain vector at the output side. 
+    """
+    b = np.broadcast(fvecin[..., None],rmat[...,0:4,0:4], fmatin, fmatout)
+    
+    if fvecin.shape != b.shape[:-1]:
+        raise ValueError("Input field vector should have shape of {}".format(b.shape[:-1]))
+    if fvecout is not None and fvecout.shape != b.shape[:-1]:
+        raise ValueError("Output field vector should have shape of {}".format(b.shape[:-1]))
+    if fmatini is None:
+        if fmatin is None:
+            fmatin = f_iso()
+        fmatini = inv(fmatin)
+    if fmatin is None:
+        fmatin = inv(fmatini)
+    if fmatouti is None:
+        if fmatout is None:
+            fmatout = fmatin
+            fmatouti = fmatini
+        else:
+            fmatouti = inv(fmatout)
+    if fmatout is None:
+        fmatout = inv(fmatouti)
+        
+    avecin = dotmv(fmatini,fvecin)
+    
+    if gvecin is not None:
+        gvecin = dotmv(fmatini,gvecin)
+
+    if gvecout is not None:
+        gvecout = dotmv(fmatouti,gvecout)
+        
+    if fvecout is not None:
+        avecout = dotmv(fmatouti,fvecout, out = fvecout)
+    else:
+        avecout = None
+        
+    avecout = reflect_avec(avecin,rmat,avecout,gvecin,gvecout)
+        
+    dotmv(fmatin,avecin, out = fvecin)    
+    return dotmv(fmatout,avecout, out = fvecout)
+
 def reflect(fvecin, rmat, fmatin = None, fmatout = None, fmatini = None, fmatouti = None, fvecout = None, gvecin = None, gvecout = None):
     """Reflects/Transmits field vector using 4x4 reflection matrix.
     
@@ -1549,6 +2475,10 @@ def reflect(fvecin, rmat, fmatin = None, fmatout = None, fmatini = None, fmatout
     fvecout : (...,4) array, optional
         The ouptut field vector array. This function will update the output array 
         with the calculated transmitted field.
+    gvecin : (...,4) array, optional
+        Specifies the field gain vector at the input side. 
+    gvecout : (...,4) array, optional
+        Specifies the field gain vector at the output side. 
     """
     b = np.broadcast(fvecin[..., None],rmat[...,0:4,0:4], fmatin, fmatout)
     
@@ -1586,15 +2516,17 @@ def reflect(fvecin, rmat, fmatin = None, fmatout = None, fmatini = None, fmatout
 
     if gvecin is not None:
         a[...,0::2] -= gvecin[...,0::2]
-
-    if gvecout is not None:
-        a[...,1::2] -= gvecout[...,1::2]
         
+
     if fvecout is not None:
         bvec = dotmv(fmatouti,fvecout)
         a[...,1::2] = bvec[...,1::2] 
     else:
         bvec = np.zeros_like(avec)
+        
+    if gvecout is not None:
+        a[...,1::2] -= gvecout[...,1::2]
+        
 
     out = dotmv(rmat,a, out = fvecout)
     
@@ -1605,80 +2537,10 @@ def reflect(fvecin, rmat, fmatin = None, fmatout = None, fmatini = None, fmatout
         avec[...,1::2] += gvecin[...,1::2]
 
     if gvecout is not None:
-        avec[...,::2] += gvecout[...,::2]
+        bvec[...,0::2] += gvecout[...,0::2]
         
     dotmv(fmatin,avec,out = fvecin)    
     return dotmv(fmatout,bvec,out = out)
-
-
-
-def gain(gvec, smat, fmatin = None, fmatout = None, fmatini = None, fmatouti = None, fvecout = None):
-    """Reflects/Transmits field vector using 4x4 reflection matrix.
-    
-    This functions takes a field vector that describes the input field and
-    computes the output transmited field and also updates the input field 
-    with the reflected waves.
-   
-    Parameters
-    ----------
-    fvecin : (...,4) array
-        Input field vector array. This function will update the input array  
-        with the calculated reflected field
-    rmat : (...,4,4) array
-        Reflection matrix.
-    fmatin : (...,4,4) array
-        Input field matrix array.
-    fmatout : (...,4,4) array
-        Output field matrix array.
-    fmatini : (...,4,4) array
-        Inverse of the input field matrix array.
-    fmatouti : (...,4,4) array, optional
-        Inverse of the output field matrix array. If not provided, it is computed
-        from `fmatout`.
-    fvecout : (...,4) array, optional
-        The ouptut field vector array. This function will update the output array 
-        with the calculated transmitted field.
-    """
-    si = Si_mat(smat)
-    
-    
-    
-    b = np.broadcast(gvec[..., None],smat[...,0:4,0:4], fmatin, fmatout)
-    
-    if gvec.shape != b.shape[:-1]:
-        raise ValueError("Input field vector should have shape of {}".format(b.shape[:-1]))
-    if fvecout is not None and fvecout.shape != b.shape[:-1]:
-        raise ValueError("Output field vector should have shape of {}".format(b.shape[:-1]))
-    if fmatini is None:
-        if fmatin is None:
-            fmatin = f_iso()
-        fmatini = inv(fmatin)
-    if fmatin is None:
-        fmatin = inv(fmatini)
-    if fmatouti is None:
-        if fmatout is None:
-            fmatout = fmatin
-            fmatouti = fmatini
-        else:
-            fmatouti = inv(fmatout)
-    if fmatout is None:
-        fmatout = inv(fmatouti)
-        
-
-    gvec = dotmv(fmatini,gvec)
-    
-    avec = np.zeros(b.shape[:-1], gvec.dtype)
-    bvec = np.zeros(b.shape[:-1], gvec.dtype)
-    
-
-    out = dotmv(si,gvec)
-    
-    avec[...,1::2] = out[...,1::2]
-    bvec[...,::2] = out[...,::2]
-    
-        
-    return dotmv(fmatin,avec), dotmv(fmatout,bvec)
-
 
 
 def transmit2x2(fvecin, cmat, fmatin = None, fmatout = None, fmatini = None, fmatouti = None, tmatin = None, tmatout = None, fvecout = None):
@@ -1872,7 +2734,7 @@ def transfer4x4(fvecin, kd, epsv, epsa,  beta = 0., phi = 0., nin = 1., nout = 1
         
         #make fresnel reflection of the input (forward propagating) field
         fin = f_iso(n = nin, beta  = beta, phi = phi)
-        alpha,fmatin = alphaf(beta = beta, phi = phi, epsv = epsv[0], epsa = epsa[0])
+        alpha,fmatin = field_eig(beta = beta, phi = phi, epsilon = epsv[0], angles = epsa[0])
         
         t = T_mat(fmatin = fin, fmatout = fmatin, mode = +1)
         fveci = dotmv(t,fveci, out = fveci)
@@ -1887,7 +2749,7 @@ def transfer4x4(fvecin, kd, epsv, epsa,  beta = 0., phi = 0., nin = 1., nout = 1
       
     if reflect_out == True:
         #make fresnel reflection of the output (backward propagating) field
-        alpha,fmatout = alphaf(beta = beta, phi = phi, epsv = epsv[-1], epsa = epsa[-1])
+        alpha,fmatout = field_eig(beta = beta, phi = phi, epsilon = epsv[-1], angles = epsa[-1])
         fout = f_iso(n = nout, beta  = beta, phi = phi)
         if fvecf is not None:
             t = T_mat(fmatin = fout, fmatout = fmatout, mode = -1)
@@ -1967,7 +2829,7 @@ def transfer2x2(evec, kd, epsv, epsa,  beta = 0., phi = 0., nin  = None, nout = 
         
     if nin is not None:
        fin = f_iso(n = nin, beta  = beta, phi = phi)
-       alpha,fout = alphaf(beta = beta, phi = phi, epsv = epsv[0], epsa = epsa[0])
+       alpha,fout = field_eig(beta = beta, phi = phi, epsilon = epsv[0], angles = epsa[0])
        tmat = t_mat(fin,fout)
        evec = dotmv(tmat,evec)
     
@@ -1976,7 +2838,7 @@ def transfer2x2(evec, kd, epsv, epsa,  beta = 0., phi = 0., nin  = None, nout = 
     
     if nout is not None:
        fout = f_iso(n = nout, beta  = beta, phi = phi)
-       alpha,fin = alphaf(beta = beta, phi = phi, epsv = epsv[-1], epsa = epsa[-1])
+       alpha,fin = field_eig(beta = beta, phi = phi, epsilon = epsv[-1], angles = epsa[-1])
        tmat = t_mat(fin,fout)
        dotmv(tmat,evec, out = evec)  
        
@@ -2194,4 +3056,4 @@ __all__ = ["alphaf","alphaffi","phase_mat", "fvec", "avec", "fvec2avec",
 
 if __name__ == "__main__":
     import doctest
-    doctest.testmod()
+    #doctest.testmod()

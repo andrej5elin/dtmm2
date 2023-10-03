@@ -51,13 +51,15 @@ import numpy as np
 from dtmm2.conf import FDTYPE,CDTYPE, cached_function, get_default_config_option, deprecation
 import dtmm2.fft as fft
 
-def betaphi(shape, k0, out = None):
+def betaphi(shape, k0, aspect = 1., out = None):
     """Returns beta and phi arrays of all possible plane eigenwaves.
     
     Parameters
     ----------
     shape : (int,int)
         Shape (height, width) of the plane eigenwave.
+    aspect : float
+        Pixel aspect ratio
     k0 : float or array of floats
         Wavenumber (or wavenumbers) in pixel units.
     out : (ndarray, ndarray), optional
@@ -71,6 +73,10 @@ def betaphi(shape, k0, out = None):
     """
     if out is None:
         out = None, None
+    if aspect != 1.:
+        betax, betay = betaxy(shape,k0, aspect = aspect, out = out)
+        return betaxy2betaphi(betax,betay, out = (betax, betay))
+    
     if len(shape) not in (2,3):
         deprecation("betaphi: In the future exception will be raised if shape is not of length 2 or 3")
     k0 = np.abs(np.asarray(k0, FDTYPE)[...,np.newaxis,np.newaxis]) #make it broadcastable
@@ -80,8 +86,9 @@ def betaphi(shape, k0, out = None):
     phi  = np.arctan2(yy,xx, out = out[1])
     return beta, phi
 
-@cached_function
-def betaxy(shape, k0, out = None):
+
+#@cached_function
+def betaxy(shape, k0, aspect = 1., out = None):
     """Returns betax, betay arrays of plane eigenwaves.
     
     Parameters
@@ -96,7 +103,7 @@ def betaxy(shape, k0, out = None):
     Returns
     -------
     out : array, array
-        beta, phi arrays      
+        betax, betay arrays      
     """
     if len(shape) not in (2,3):
         deprecation("betaxy: In the future exception will be raised if shape is not of length 2 or 3")
@@ -107,35 +114,47 @@ def betaxy(shape, k0, out = None):
     if out is None:
         out = None, None
     l = (2 * np.pi / k0)
-    return np.multiply(l,xx, out = out[0]), np.multiply(l,yy, out = out[1])
+    return np.multiply(l,xx, out = out[0]), np.multiply(l*aspect,yy, out = out[1])
 
-def betaxy2betaphi(betax, betay):
+def betaxy2betaphi(betax, betay, out = None):
     """Converts betax, betay arrays to beta, phi arrays."""
-    phi  = betaxy2phi(betax, betay)
-    beta = betaxy2beta(betax, betay)
+    if out is None:
+        out1, out2 = None, None
+    else:
+        out1, out2 = out
+        if betax is out1:
+            betax = betax.copy()
+    beta = betaxy2beta(betax, betay, out = out1)
+    phi  = betaxy2phi(betax, betay, out = out2)
     return beta, phi
 
-def betaxy2beta(betax, betay):
+def betaxy2beta(betax, betay, out = None):
     """Converts betax, betay arrays to beta array"""
-    return np.sqrt(betax**2 + betay**2)
+    return np.sqrt(betax**2 + betay**2, out = out)
 
-def betaxy2phi(betax, betay):
+def betaxy2phi(betax, betay, out = None):
     """Converts betax, betay arrays to phi array"""
-    return np.arctan2(betay, betax)
+    return np.arctan2(betay, betax, out = out)
 
-def betaphi2betaxy(beta, phi):
+def betaphi2betaxy(beta, phi, out = None):
     """Converts beta, phi arrays to betax, betay arrays."""
-    betax = betaphi2betax(beta, phi)
-    betay = betaphi2betay(beta, phi)
+    if out is None:
+        out1, out2 = None, None
+    else:
+        out1, out2 = out
+        if beta is out1:
+            beta = beta.copy()
+    betax = betaphi2betax(beta, phi, out = out1)
+    betay = betaphi2betay(beta, phi, out = out2)
     return betax, betay
 
-def betaphi2betax(beta, phi):
+def betaphi2betax(beta, phi, out = None):
     """Converts beta, phi arrays to betax array."""
-    return beta*np.cos(phi)
+    return beta*np.cos(phi, out = out)
 
-def betaphi2betay(beta, phi):
+def betaphi2betay(beta, phi, out = None):
     """Converts beta, phi arrays to betay array."""
-    return beta*np.sin(phi)
+    return beta*np.sin(phi, out = out)
 
 def eigenwave(shape, i, j, amplitude = None, out = None):
     """Returns a planewave with a given fourier coefficient indices i and j. 
@@ -170,7 +189,7 @@ def eigenwave(shape, i, j, amplitude = None, out = None):
     return fft.ifft2(f, out = out)
 
 @cached_function
-def eigenbeta(shape, k0, betamax = None):
+def eigenbeta(shape, k0, betamax = None, aspect = 1.):
     """Returns masked beta array(s) of all valid eigenwaves.
     
     Parameters
@@ -188,7 +207,7 @@ def eigenbeta(shape, k0, betamax = None):
         Masked beta array(s).  
     """    
     betamax = get_default_config_option("betamax", betamax)
-    b,p = betaphi(shape, k0)
+    b,p = betaphi(shape, k0,aspect = aspect)
     mask = b <= betamax
     if mask.ndim == 3:
         bp = tuple([b[i][mask[i]] for i in range(mask.shape[0])])
@@ -198,7 +217,7 @@ def eigenbeta(shape, k0, betamax = None):
         return b
     
 @cached_function
-def eigenindices(shape, k0, betamax = None):
+def eigenindices(shape, k0, betamax = None, aspect = 1.):
     """Returns masked indices array(s) of all valid eigenwaves.
     
     Parameters
@@ -217,7 +236,7 @@ def eigenindices(shape, k0, betamax = None):
     """
     betamax = get_default_config_option("betamax", betamax)
     ii, jj = np.meshgrid(range(shape[-2]), range(shape[-1]),copy = False, indexing = "ij") 
-    mask = eigenmask(shape, k0, betamax)
+    mask = eigenmask(shape, k0, betamax, aspect)
     if mask.ndim == 3: #multiwavelength
         out = (_get_indices_array(ii,jj, mask[i]) for i in range(mask.shape[0]))
         return tuple(out)
@@ -225,7 +244,7 @@ def eigenindices(shape, k0, betamax = None):
         return _get_indices_array(ii,jj, mask)
     
 @cached_function
-def eigenphi(shape, k0, betamax = None):
+def eigenphi(shape, k0, betamax = None, aspect = 1.):
     """Returns masked phi array(s) of all valid eigenwaves.
     
     Parameters
@@ -243,7 +262,7 @@ def eigenphi(shape, k0, betamax = None):
         Masked phi array(s).  
     """
     betamax = get_default_config_option("betamax", betamax)
-    b,p = betaphi(shape, k0)
+    b,p = betaphi(shape, k0, aspect = aspect)
     mask = b <= betamax
     if mask.ndim == 3:
         pp = tuple([p[mask[i]] for i in range(mask.shape[0])])
@@ -253,7 +272,7 @@ def eigenphi(shape, k0, betamax = None):
         return p
 
 @cached_function
-def eigenmask(shape, k0, betamax = None):
+def eigenmask(shape, k0, betamax = None, aspect = 1.):
     """Returns a boolean array of valid modal coefficents. 
     
     Valid coefficients are those that have beta <= betamax.
@@ -273,7 +292,7 @@ def eigenmask(shape, k0, betamax = None):
         A boolean array of shape (height, width) or (len(k0), height, width).
     """
     betamax = get_default_config_option("betamax", betamax)
-    b,p = betaphi(shape, k0)
+    b,p = betaphi(shape, k0, aspect = aspect)
     mask = b <= betamax
     return mask
 
@@ -295,7 +314,7 @@ def k0(wavelength, pixelsize = 1.):
     out = 2*np.pi/np.asarray(wavelength) * pixelsize
     return np.asarray(out, dtype = FDTYPE)
 
-def mask2beta(mask,k0):
+def mask2beta(mask,k0, aspect = 1.):
     """Converts the input mask array to a masked beta array(s).
     
     Parameters
@@ -313,7 +332,7 @@ def mask2beta(mask,k0):
     """
     mask = np.asarray(mask)
     shape = mask.shape[-2:]
-    b,p = betaphi(shape, k0)
+    b,p = betaphi(shape, k0, aspect = aspect)
     if mask.ndim == 3:
         return tuple([b[i][mask[i]] for i in range(mask.shape[0])])
     elif mask.ndim == 2:
@@ -321,7 +340,7 @@ def mask2beta(mask,k0):
     else:
         raise ValueError("Invalid mask shape")
     
-def mask2phi(mask,k0):
+def mask2phi(mask,k0, aspect = 1.):
     """Converts the input mask array to a masked phi array(s).
     
     Parameters
@@ -339,7 +358,7 @@ def mask2phi(mask,k0):
     """
     mask = np.asarray(mask)
     shape = mask.shape[-2:]
-    b,p = betaphi(shape, k0)
+    b,p = betaphi(shape, k0, aspect = aspect)
     if mask.ndim == 3:
         return tuple([p[mask[i]] for i in range(mask.shape[0])])
     elif mask.ndim == 2:
@@ -401,7 +420,7 @@ def mask2order(mask):
     else:
         raise ValueError("Invalid mask shape")
     
-def planewave(shape, k0, beta , phi, out = None):
+def planewave(shape, k0, beta , phi, aspect = 1., out = None):
     """Returns a 2D planewave array with a given beta, phi, wave number k0.
     
     Broadcasting rules apply.
@@ -432,7 +451,7 @@ def planewave(shape, k0, beta , phi, out = None):
     xx = np.asarray(xx, dtype = FDTYPE)
     yy = np.asarray(yy, dtype = FDTYPE)
     kx = np.asarray(k0*beta*np.cos(phi), dtype = FDTYPE)
-    ky = np.asarray(k0*beta*np.sin(phi), dtype = FDTYPE)
+    ky = np.asarray(k0*beta*np.sin(phi)/aspect, dtype = FDTYPE)
     out = np.exp((1j*(kx*xx+ky*yy)), out = out)
     return np.divide(out,out[...,0,0][...,None,None],out)
 

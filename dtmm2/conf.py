@@ -44,6 +44,7 @@ C = None
 NUMBA_PARALLEL = None
 NCDTYPE = None
 NFDTYPE = None
+NUDTYPE = None
 
 
 DATAPATH = os.path.dirname(__file__)
