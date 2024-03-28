@@ -1840,7 +1840,9 @@ def transfer_mat(kd, epsilon = None, angles = None, beta = None, phi = None, wit
     else:
         alpha,fmat,fmati = field_eigi(epsilon, angles, beta, phi)
 
+    #TODO: optimize, store to alpha if possible (broadcastable)
     pmat = phase_mat(alpha,kd, out = alpha)
+    #pmat = phase_mat(alpha,kd)
     
     if with_hzez == True:
         if out is None:
