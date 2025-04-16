@@ -9,7 +9,7 @@ from dtmm2.fft import fft2, ifft2
 from dtmm2.linalg import dotmf, inv, dotmm, dotmdm
 from dtmm2.wave import betaphi, k0
 from dtmm2.tmm import field_mat, _default_epsv_epsa, field_eig, phase_mat
-from dtmm.data import refind2eps
+from dtmm2.data import refind2eps
 from dtmm2.conf import FDTYPE
 import numpy as np
 

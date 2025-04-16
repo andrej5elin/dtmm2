@@ -5,18 +5,12 @@ Created on Mon Sep 25 10:38:23 2023
 
 @author: andrej
 """
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Sat Sep 23 20:00:33 2023
 
-@author: andrej
-"""
 from dtmm2.fft import fft2, ifft2
 from dtmm2.linalg import dotmf, inv, dotmm, dotmdm, dotmv
 from dtmm2.wave import betaphi, k0, eigenmask
 from dtmm2.tmm import field_mat, _default_epsv_epsa, field_eig, phase_mat, field_eigi, _default_beta_phi, transfer_mat, system_mat, reflection_mat, hzez_mat
-from dtmm.data import refind2eps
+from dtmm2.data import refind2eps
 from dtmm2.conf import FDTYPE
 import numpy as np
 

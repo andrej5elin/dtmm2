@@ -10,7 +10,7 @@ The implementation is based on standard formulation of 4x4 transfer matrix metho
 ----------
 
 Layers are stacked in the z direction, field vectors describing the field are 
-f = (Ex,Hy,Ey,Hx), Core functionality is defined by field matrix calculation
+m = (Ex,Hy,Ey,Hx), Core functionality is defined by field matrix calculation
 functions:
     
 Field vector creation/conversion functions
@@ -65,7 +65,8 @@ import numpy as np
 from dtmm2.conf import NCDTYPE,NFDTYPE, NUDTYPE, CDTYPE, FDTYPE, NUMBA_TARGET, \
                         NUMBA_PARALLEL, NUMBA_CACHE, NUMBA_FASTMATH, DTMMConfig, deprecation
 from dtmm2.rotation import  _calc_rotations_uniaxial, _calc_rotations, _rotate_diagonal_tensor, _rotate_tensor
-from dtmm2.linalg import _dotr2m, dotmdm, dotmm, inv, dotmv, _dotr2v
+from dtmm2.linalg import  dotmdm, dotmm, inv, dotmv
+from dtmm2._linalg import _dotr2m, _dotr2v, _dotmr2
 from dtmm2.data import refind2eps
 from dtmm2.rotation import rotation_vector2, rotation_matrix, rotate_tensor, rotate_diagonal_tensor
 from dtmm2.print_tools import print_progress
@@ -116,34 +117,6 @@ def _mode_to_int(mode):
 @nb.njit([(NFDTYPE,NCDTYPE[:],NCDTYPE[:,:])])                                                                
 def _auxiliary_matrix(beta,eps,Lm):
     """Computes all elements of the auxiliary matrix of shape 4x4."""
-    eps2m = 1./eps[2]
-    eps4eps2m = eps[4]*eps2m
-    eps5eps2m = eps[5]*eps2m
-    
-    Lm[0,0] = (-beta*eps4eps2m)
-    Lm[0,1] = 1.-beta*beta*eps2m
-    Lm[0,2] = (-beta*eps5eps2m)
-    Lm[0,3] = 0.
-    Lm[1,0] = eps[0]- eps[4]*eps4eps2m
-    Lm[1,1] = Lm[0,0]
-    Lm[1,2] = eps[3]- eps[5]*eps4eps2m
-    Lm[1,3] = 0.
-    Lm[2,0] = 0.
-    Lm[2,1] = 0.
-    Lm[2,2] = 0.
-    Lm[2,3] = -1. 
-    Lm[3,0] = (-1.0*Lm[1,2])
-    Lm[3,1] = (-1.0*Lm[0,2])
-    Lm[3,2] = beta * beta + eps[5]*eps5eps2m - eps[1]  
-    Lm[3,3] = 0.  
-    
-
-@nb.guvectorize([(NFDTYPE[:],NCDTYPE[:],NCDTYPE[:],NCDTYPE[:,:])],
-                 "(),(k),(n)->(n,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)                                                               
-def _auxiliary_matrix_vec(beta,eps,dummy,Lm):
-    """Computes all elements of the auxiliary matrix of shape 4x4."""
-    assert len(eps) == 6
-    
     #conpy in case we are reusing eps memory for output
     eps0 = eps[0]
     eps1 = eps[1]
@@ -152,7 +125,6 @@ def _auxiliary_matrix_vec(beta,eps,dummy,Lm):
     eps4 = eps[4]
     eps5 = eps[5]
     
-    beta = beta[0]
     eps2m = 1./eps2
     eps4eps2m = eps4*eps2m
     eps5eps2m = eps5*eps2m
@@ -171,15 +143,83 @@ def _auxiliary_matrix_vec(beta,eps,dummy,Lm):
     Lm[2,3] = -1. 
     Lm[3,0] = (-1.0*Lm[1,2])
     Lm[3,1] = (-1.0*Lm[0,2])
-    Lm[3,2] = beta * beta + eps5*eps5eps2m - eps1 
+    Lm[3,2] = beta * beta + eps5*eps5eps2m - eps1  
     Lm[3,3] = 0.  
-      
+    
+
+@nb.guvectorize([(NFDTYPE[:],NCDTYPE[:],NCDTYPE[:],NCDTYPE[:,:])],
+                 "(),(k),(n)->(n,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)                                                               
+def _auxiliary_matrix_vec(beta,eps,dummy,Lm):
+    """Computes all elements of the auxiliary matrix of shape 4x4."""
+    assert len(eps) == 6
+    _auxiliary_matrix(beta[0],eps,Lm)
+    
 def auxiliary_matrix(beta = None, epsilon = None, out = None):
     """Computes auxiliary matrix in refraction plane"""
     beta, phi = _default_beta_phi(beta,None)
     epsilon = _default_epsilon(epsilon)
     return _auxiliary_matrix_vec(beta,epsilon,_dummy_array,out)
-    
+  
+# @nb.njit([(NFDTYPE,NCDTYPE,NCDTYPE[:,:])], cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
+# def _f_iso(beta,eps,F):
+#     """computes eigenvalue alpha and eigenvector field matrix of isotropic material"""
+#     #n = eps0[0]**0.5
+#     aout = sqrt(eps-beta**2)
+#     if aout != 0.:
+#         gpout = eps/aout
+#         gsout = -aout
+#         F[0,0] = 0.5 
+#         F[0,1] = 0.5
+#         F[0,2] = 0.
+#         F[0,3] = 0.
+#         F[1,0] = 0.5 * gpout 
+#         F[1,1] = -0.5 * gpout 
+#         F[1,2] = 0.
+#         F[1,3] = 0.
+#         F[2,0] = 0.
+#         F[2,1] = 0.
+#         F[2,2] = 0.5 
+#         F[2,3] = 0.5
+#         F[3,0] = 0.
+#         F[3,1] = 0.
+#         F[3,2] = 0.5 * gsout 
+#         F[3,3] = -0.5 * gsout 
+#     else:
+        
+#         F[...]=0.
+
+#set to 0.5 or 1.        
+POYNTING_NORM = 0.5
+        
+@nb.njit([(NFDTYPE,NCDTYPE,NCDTYPE[:,:])], cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
+def _f_iso(beta,eps,F):
+    """computes eigenvalue alpha and eigenvector field matrix of isotropic material"""
+    #n = eps0[0]**0.5
+    aout = sqrt(eps-beta**2)
+    if aout != 0.:
+        gpout = eps/aout
+        gsout = -aout
+        pfact = 1/np.sqrt(POYNTING_NORM*np.abs(np.real(gpout)))
+        sfact = 1/np.sqrt(POYNTING_NORM*np.abs(np.real(gsout)))
+        F[0,0] = pfact
+        F[0,1] = pfact
+        F[0,2] = 0.
+        F[0,3] = 0.
+        F[1,0] = pfact * gpout 
+        F[1,1] = - pfact * gpout 
+        F[1,2] = 0.
+        F[1,3] = 0.
+        F[2,0] = 0.
+        F[2,1] = 0.
+        F[2,2] = sfact 
+        F[2,3] = sfact
+        F[3,0] = 0.
+        F[3,1] = 0.
+        F[3,2] = sfact * gsout 
+        F[3,3] = -sfact * gsout 
+    else:
+        
+        F[...]=0.
 
 @nb.njit([(NFDTYPE,NCDTYPE[:],NCDTYPE[:],NCDTYPE[:,:])], cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
 def _alphaf_iso(beta,eps0,alpha,F):
@@ -213,13 +253,13 @@ def _alphaf_iso(beta,eps0,alpha,F):
         
         F[...]=0.
         alpha[...] = 0.
-        
+
 @nb.njit([NFDTYPE(NCDTYPE[:])], cache = NUMBA_CACHE)
 def _poynting(field):
     """Computes poynting vector from the field vector"""
     tmp1 = (field[0].real * field[1].real + field[0].imag * field[1].imag)
     tmp2 = (field[2].real * field[3].real + field[2].imag * field[3].imag)
-    return (tmp1-tmp2)
+    return (tmp1-tmp2)*POYNTING_NORM    
 
 @nb.njit([(NFDTYPE,NCDTYPE[:],NFDTYPE[:,:],NCDTYPE[:],NCDTYPE[:,:])], cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
 def _alphaf_uniaxial(beta,eps0,R,alpha,F): 
@@ -356,7 +396,25 @@ def _alphaf_uniaxial(beta,eps0,R,alpha,F):
             F[2,j] = F[2,j]/tmp 
             F[3,j] = F[3,j]/tmp 
             
-        
+@nb.njit([(NCDTYPE[:,:], NCDTYPE[:,:])])
+def _normalize_mat(fmat, out):
+    for i in range(4):
+        if fmat.shape[0] == 6:
+            n = np.abs(_poynting(fmat[1:-1,i]))**0.5
+        else:
+            n = np.abs(_poynting(fmat[:,i]))**0.5
+        if n == 0.:
+            n = 0.
+        else:
+            n = 1./n
+        out[0,i] = fmat[0,i] * n 
+        out[1,i] = fmat[1,i] * n
+        out[2,i] = fmat[2,i] * n
+        out[3,i] = fmat[3,i] * n
+        if fmat.shape[0] == 6:
+            out[4,i] = fmat[4,i] * n
+            out[5,i] = fmat[5,i] * n    
+            
 @nb.njit([(NCDTYPE[:],NCDTYPE[:,:],NCDTYPE[:],NCDTYPE[:,:])], cache = NUMBA_CACHE)
 def _copy_sorted(alpha,fmat, out_alpha, out_fmat):
     """Eigen modes sorting based on the computed poynting vector direction"""
@@ -433,9 +491,10 @@ def _alphaf_vec(case,beta,phi,rv,epsv,epsa,dummy,alpha,F):
         _calc_rotations_uniaxial(phi[0],epsa,R) #store rotation matrix in Fi.real[0:3,0:3]
         _alphaf_uniaxial(beta[0],epsv,R,alpha,F)
         _dotr2m(rv,F,F)
+        
     else:#biaxial case or 6-component
         R = F.real 
-        eps = F.ravel() #reuse F memory (eps is length 6 1D array)
+        eps = np.empty((6,), epsv.dtype)
         _calc_rotations(phi[0],epsa,R) #store rotation matrix in Fi.real[0:3,0:3]
         if CASE == 3:
             _rotate_diagonal_tensor(R,epsv,eps)
@@ -447,18 +506,24 @@ def _alphaf_vec(case,beta,phi,rv,epsv,epsa,dummy,alpha,F):
         _copy_sorted(alpha0,F0,alpha,F)#copy data and sort it
         _dotr2m(rv,F,F)
         
-
-@nb.guvectorize([(NUDTYPE[:],NFDTYPE[:],NFDTYPE[:],NFDTYPE[:],NCDTYPE[:],NFDTYPE[:],NCDTYPE[:,:],NCDTYPE[:],NCDTYPE[:,:],NCDTYPE[:,:])],
-                 "(),(),(),(m),(l),(k),(m,n)->(n),(n,n),(m,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
-def _alphafhe_vec(case,beta,phi,rv,epsv,epsa,dummy,alpha,F,HE):
+@nb.guvectorize([(NUDTYPE[:],NFDTYPE[:],NFDTYPE[:],NFDTYPE[:],NCDTYPE[:],NFDTYPE[:],NCDTYPE[:,:],NCDTYPE[:],NCDTYPE[:,:])],
+                 "(),(),(),(j),(k),(l),(m,n)->(n),(m,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
+def _alphaf6_vec(case,beta,phi,rv,epsv,epsa,dummy,alpha,F):
     """eigenvalue solver. Depending on the material parameter
     we choose isotropic, uniaxial  or a biaxial solver.
     
     Becaue the auxiliary matrix is written in the rotated frame (in the plane of incidence with phi = 0)
     We need to rotate the computed vectors using _dotr2m 
     """
+    
+    if dummy.shape[0] == 6:
+        FULL_MATRIX = True # output a 6x4 matrix
+    else:
+        FULL_MATRIX = False # output a 4x4 matrix
+
     CASE = case[0]
-    #F is a 4x4 matrix... we can use 3x3 part for Rotation matrix and F[3] for eps  temporary data
+    
+    # auto determine CASE
     if CASE == 0:
         if len(epsv) == 6 and (epsv[3] != 0 or epsv[4] != 0 or epsv[5] != 0):
             # in case we use 6 component tensor, and at least one offdiagonal is not zero
@@ -472,44 +537,209 @@ def _alphafhe_vec(case,beta,phi,rv,epsv,epsa,dummy,alpha,F,HE):
         else:
             CASE = 3 #biaxial with diagonal eps
             
+    #F is a 6x4 matrix... we can use 3x3 part for Rotation matrix and F[:,3] for eps temporary data      
+    
+    R = F.real[0:3,0:3] #reuse array
+
     #isotropic case
     if CASE == 1:
-        eps = F[3] 
+        if FULL_MATRIX:
+            e0 = 0. #eps_zx/eps_zz
+            e1 = -beta[0]/epsv[2] #beta/eps_zz
+            e2 = 0. #eps_zy/eps_zz
         _alphaf_iso(beta[0],epsv,alpha,F)
-        _dotr2m(rv,F,F)
     #uniaxial
     elif CASE == 2:
-        R = F.real
-        eps = F[3] 
         _calc_rotations_uniaxial(phi[0],epsa,R) #store rotation matrix in Fi.real[0:3,0:3]
+        if FULL_MATRIX:
+            eps = F[:,3]
+            _rotate_diagonal_tensor(R,epsv,eps)
+            e0 = -eps[4]/eps[2] #eps_zx/eps_zz
+            e1 = -beta[0]/eps[2] #beta/eps_zz
+            e2 = -eps[5]/eps[2] #eps_zy/eps_zz
         _alphaf_uniaxial(beta[0],epsv,R,alpha,F)
-        _dotr2m(rv,F,F)
+        
     else:#biaxial case or 6-component
-        R = F.real 
-        eps = F.ravel() #reuse F memory (eps is length 6 1D array)
+        _calc_rotations(phi[0],epsa,R) #store rotation matrix in Fi.real[0:3,0:3]
+        if FULL_MATRIX == True:
+            eps = F[:,3] # we can use F matrix
+        else:
+            eps = np.empty((6,), epsv.dtype)
+        
+        if CASE == 3:
+            _rotate_diagonal_tensor(R,epsv,eps)
+        else: #CASE 0, we must rotate full 6-component tensor
+            assert len(epsv) >= 6
+            _rotate_tensor(R,epsv,eps)
+        if FULL_MATRIX:
+            e0 = -eps[4]/eps[2] #eps_zx/eps_zz
+            e1 = -beta[0]/eps[2] #beta/eps_zz
+            e2 = -eps[5]/eps[2] #eps_zy/eps_zz
+        _auxiliary_matrix(beta[0],eps,F) #calculate Lm matrix and put it to F
+        alpha0,F0 = np.linalg.eig(F[0:4])
+        _copy_sorted(alpha0,F0,alpha,F[0:4])#copy data and sort it
+        
+    if FULL_MATRIX:
+        
+        F00 = beta[0]*F[2,0]
+        F01 = beta[0]*F[2,1]
+        F02 = beta[0]*F[2,2]
+        F03 = beta[0]*F[2,3]
+        
+        F50 = e0 * F[0,0] + e1 * F[1,0] + e2 * F[2,0]
+        F51 = e0 * F[0,1] + e1 * F[1,1] + e2 * F[2,1]
+        F52 = e0 * F[0,2] + e1 * F[1,2] + e2 * F[2,2]
+        F53 = e0 * F[0,3] + e1 * F[1,3] + e2 * F[2,3]
+    
+    _dotr2m(rv,F,F)
+    
+    if FULL_MATRIX:
+        #reorder and fill
+        F[5,0] = F50
+        F[5,1] = F51
+        F[5,2] = F52
+        F[5,3] = F53
+        
+        F[4] = F[3]
+        F[3] = F[2]
+        F[2] = F[1]
+        F[1] = F[0]
+            
+        F[0,0] = F00
+        F[0,1] = F01
+        F[0,2] = F02
+        F[0,3] = F03
+        
+    #_normalize_mat(F,F)
+
+@nb.guvectorize([(NFDTYPE[:],NFDTYPE[:],NFDTYPE[:],NCDTYPE[:],NCDTYPE[:,:],NCDTYPE[:,:])],
+                 "(),(),(l),(),(m,n)->(m,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
+def _b_vec(beta,phi,rv,eps,dummy,F):
+    if dummy.shape[0] == 6:
+        FULL_MATRIX = True # output a 6x4 matrix
+    else:
+        FULL_MATRIX = False # output a 4x4 matrix
+
+    _f_iso(beta[0],eps[0],F)
+    
+    if FULL_MATRIX:
+        e0 = 0. #eps_zx/eps_zz
+        e1 = -beta[0]/eps[0] #beta/eps_zz
+        e2 = 0. #eps_zy/eps_zz
+    
+    _dotmr2(F,rv,F)
+
+    if FULL_MATRIX:
+        
+        F00 = beta[0]*F[2,0]
+        F01 = beta[0]*F[2,1]
+        F02 = beta[0]*F[2,2]
+        F03 = beta[0]*F[2,3]
+        
+        F50 = e0 * F[0,0] + e1 * F[1,0] + e2 * F[2,0]
+        F51 = e0 * F[0,1] + e1 * F[1,1] + e2 * F[2,1]
+        F52 = e0 * F[0,2] + e1 * F[1,2] + e2 * F[2,2]
+        F53 = e0 * F[0,3] + e1 * F[1,3] + e2 * F[2,3]
+    
+    _dotr2m(rv,F,F)
+    
+    if FULL_MATRIX:
+        #reorder and fill
+        F[5,0] = F50
+        F[5,1] = F51
+        F[5,2] = F52
+        F[5,3] = F53
+        
+        F[4] = F[3]
+        F[3] = F[2]
+        F[2] = F[1]
+        F[1] = F[0]
+            
+        F[0,0] = F00
+        F[0,1] = F01
+        F[0,2] = F02
+        F[0,3] = F03    
+    
+    
+@nb.guvectorize([(NFDTYPE[:],NFDTYPE[:],NFDTYPE[:],NCDTYPE[:],NCDTYPE[:,:],NCDTYPE[:,:])],
+                 "(),(),(m),(),(m,n)->(n,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
+def _f_iso_vec(beta,phi,rv,eps,dummy,F):
+    _f_iso(beta[0],eps[0],F)
+    _dotr2m(rv,F,F)
+    
+@nb.guvectorize([(NUDTYPE[:],NFDTYPE[:],NFDTYPE[:],NFDTYPE[:],NCDTYPE[:],NFDTYPE[:],NCDTYPE[:,:],NCDTYPE[:],NCDTYPE[:,:],NCDTYPE[:,:])],
+                 "(),(),(),(m),(l),(k),(m,n)->(n),(n,n),(m,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
+def _alphafhe_vec(case,beta,phi,rv,epsv,epsa,dummy,alpha,F,HE):
+    """eigenvalue solver. Depending on the material parameter
+    we choose isotropic, uniaxial  or a biaxial solver.
+    
+    Becaue the auxiliary matrix is written in the rotated frame (in the plane of incidence with phi = 0)
+    We need to rotate the computed vectors using _dotr2m 
+    """
+    
+    CASE = case[0]
+    
+    #F is a 4x4 matrix... we can use 3x3 part for Rotation matrix and F[3] for eps  temporary data
+    if CASE == 0:
+        if len(epsv) == 6 and (epsv[3] != 0 or epsv[4] != 0 or epsv[5] != 0):
+            # in case we use 6 component tensor, and at least one offdiagonal is not zero
+            # we must treat the sample as a biaxial
+            CASE = 4 # biaxial with off-diag epsilon
+        elif (epsv[0] == epsv[1]):
+            if epsv[1]==epsv[2]:
+                CASE = 1 #isotropic
+            else:
+                CASE = 2 #uniaxial
+        else:
+            CASE = 3 #biaxial with diagonal eps
+           
+    R = F.real
+
+    #isotropic case
+    if CASE == 1:
+        e0 = 0. #eps_zx/eps_zz
+        e1 = -beta[0]/epsv[2] #beta/eps_zz
+        e2 = 0. #eps_zy/eps_zz
+        _alphaf_iso(beta[0],epsv,alpha,F)
+    #uniaxial
+    elif CASE == 2:
+        eps = np.empty((6,),epsv.dtype)
+        _calc_rotations_uniaxial(phi[0],epsa,R) #store rotation matrix in Fi.real[0:3,0:3]
+        _rotate_diagonal_tensor(R,epsv,eps)
+        _alphaf_uniaxial(beta[0],epsv,R,alpha,F)
+        e0 = -eps[4]/eps[2] #eps_zx/eps_zz
+        e1 = -beta[0]/eps[2] #beta/eps_zz
+        e2 = -eps[5]/eps[2] #eps_zy/eps_zz
+    else:#biaxial case or 6-component
+        eps = np.empty((6,),epsv.dtype)
+        #eps = F.ravel()#reuse F memory (eps is length 6 1D array)
         _calc_rotations(phi[0],epsa,R) #store rotation matrix in Fi.real[0:3,0:3]
         if CASE == 3:
             _rotate_diagonal_tensor(R,epsv,eps)
         else: #CASE 0, we must rotate full 6-component tensor
             assert len(epsv) >= 6
             _rotate_tensor(R,epsv,eps)
+        e0 = -eps[4]/eps[2] #eps_zx/eps_zz
+        e1 = -beta[0]/eps[2] #beta/eps_zz
+        e2 = -eps[5]/eps[2] #eps_zy/eps_zz
         _auxiliary_matrix(beta[0],eps,F) #calculate Lm matrix and put it to F
-        alpha0,F0 = np.linalg.eig(F)
+        alpha0,F0 = np.linalg.eig(F[0:4])
         _copy_sorted(alpha0,F0,alpha,F)#copy data and sort it
-        _dotr2m(rv,F,F)
+    
+    _dotr2m(rv,F,F)
         
     e0 = -eps[4]/eps[2] #eps_zx/eps_zz
     e1 = -beta[0]/eps[2] #eps_zx/eps_zz
     e2 = -eps[5]/eps[2] #eps_zy/eps_zz
     
-    HE[0,0] = beta[0] * rv[0]
+    HE[0,0] = -beta[0] * rv[1]
     HE[0,1] = 0
-    HE[0,2] = -beta[0] * rv[1]
+    HE[0,2] = beta[0] * rv[0]
     HE[0,3] = 0
     
     HE[1,0] = e0 * rv[0] - e2 * rv[1]
     HE[1,1] = e1* rv[0]
-    HE[1,2] = -e0 * rv[1] + e2 * rv[0]
+    HE[1,2] = e0 * rv[1] + e2 * rv[0]
     HE[1,3] = -e1* rv[1]
     
         
@@ -553,27 +783,28 @@ def _he_vec(beta,phi,rv,epsv,epsa,dummy,out):
     e1 = -beta[0]/eps[2] #eps_zx/eps_zz
     e2 = -eps[5]/eps[2] #eps_zy/eps_zz
     
-    out[0,0] = beta[0] * rv[0]
+    out[0,0] = -beta[0] * rv[1]
     out[0,1] = 0
-    out[0,2] = -beta[0] * rv[1]
+    out[0,2] = beta[0] * rv[0]
     out[0,3] = 0
     
     out[1,0] = e0 * rv[0] - e2 * rv[1]
     out[1,1] = e1* rv[0]
-    out[1,2] = -e0 * rv[1] + e2 * rv[0]
+    out[1,2] = e0 * rv[1] + e2 * rv[0]
     out[1,3] = -e1* rv[1]
         
-
         
 #dummy arrays for gufuncs    
 _dummy_array = np.empty((4,),CDTYPE)
 _dummy_array4 = _dummy_array
 _dummy_array6 = np.empty((6,),CDTYPE)
+_dummy_array64 = np.empty((6,4),CDTYPE)
+_dummy_array44 = np.empty((4,4),CDTYPE)
 _dummy_array24 = np.empty((2,4),CDTYPE)
 #_dummy_array2 = np.empty((9,),CDTYPE)
 _dummy_EH = np.empty((2,),CDTYPE)
-    
 
+    
 def _alphaf(beta,phi,epsv,epsa,out = None):
     rv = rotation_vector2(phi) 
     return _alphaf_vec(beta,phi,rv,epsv,epsa,_dummy_array, out = out)
@@ -591,6 +822,12 @@ def _default_epsv_epsa(epsv, epsa):
     assert epsv.shape[-1] >= 3
     assert epsa.shape[-1] >= 3
     return epsv, epsa
+
+def _default_eps_iso(eps):
+    eps = np.asarray(eps, CDTYPE) if eps is not None else np.asarray(1., CDTYPE)
+    #epsv[-1] = epsv[-1].mean()
+    return eps
+    
 
 def _default_epsilon(epsilon):
     """Checks the validity of epsilon argument and sets default values if needed"""
@@ -621,7 +858,7 @@ def eig(m, normalize = False):
     else:
         return alpha, F
 
-def field_eig(epsilon = None, angles = None, beta = None, phi = None,  normalize = True, out = None):
+def field_eig(epsilon = None, angles = None, beta = None, phi = None, normalize = True, out = None):
     """Computes alpha and field arrays (eigen values and eigen vectors arrays).
     
     Broadcasting rules apply.
@@ -675,6 +912,47 @@ def field_eig(epsilon = None, angles = None, beta = None, phi = None,  normalize
         
     #     _, f =_alphaf_vec(beta,phi,rv,epsv,epsa,_dummy_array)
     #     out = out[0], f
+    if normalize:
+        normalize_f(out[1],out[1])
+    return out
+
+def field6_eig(epsilon = None, angles = None, beta = None, phi = None,  normalize = True, field = "m", out = None):
+    """Computes alpha and field arrays (eigen values and eigen vectors arrays).
+    
+    Broadcasting rules apply.
+    
+    Parameters
+    ----------
+    beta : float, optional
+        The beta parameter of the field (defaults to 0.)
+    phi : float, optional
+        The phi parameter of the field (defaults to 0.)
+    epsilon : (...,3) array or (..., 6) array, optional
+        Dielectric tensor eigenvalues array (defaults to unity), or full dielectric
+        tensor array (diagonal and off-diagonal values)
+    angles : (...,3) array, optional
+        Euler rotation angles (psi, theta, phi) (defaults to (0.,0.,0.)) for 
+        rotation of the epsilon tensor to laboratory frame.
+    out : (ndarray,ndarray), optional
+        Output arrays.
+       
+    Returns
+    -------
+    alpha, fieldmat: (ndarray, ndarray)
+        Eigen values and eigen vectors arrays. 
+    """
+    
+    beta, phi = _default_beta_phi(beta,phi)
+    epsv, epsa = _default_epsv_epsa(epsilon, angles)
+    rv = rotation_vector2(phi)
+    case = AVAILABLE_FIELD_EIG_METHODS[FIELD_EIG_METHOD]
+    
+
+    if out is None:
+        out = _alphaf6_vec(case,beta,phi,rv,epsv,epsa,_dummy_array64)
+    else:
+        out = _alphaf6_vec(case,beta,phi,rv,epsv,epsa,_dummy_array64, out = out)
+
     if normalize:
         normalize_f(out[1],out[1])
     return out
@@ -752,24 +1030,72 @@ def field_mat(epsilon = None, angles = None, beta = None, phi = None, normalize 
     
     Parameters
     ----------
-    beta : float, optional
-        The beta parameter of the field (defaults to 0.)
-    phi : float, optional
-        The phi parameter of the field (defaults to 0.)
     epsilon : (...,3) array or (..., 6) array, optional
         Dielectric tensor eigenvalues array (defaults to unity), or full dielectric
         tensor array (diagonal and off-diagonal values)
     angles : (...,3) array, optional
         Euler rotation angles (psi, theta, phi) (defaults to (0.,0.,0.)).
+    beta : float, optional
+        The beta parameter of the field (defaults to 0.)
+    phi : float, optional
+        The phi parameter of the field (defaults to 0.)
        
     Returns
     -------
-    fieldmat: ndarray
+    F : ndarray
         Eigen vectors arrays. 
     """
     alpha, f = field_eig(epsilon,angles,beta, phi, normalize = normalize)
     return f
 
+def field_iso_mat(eps = None, beta = None, phi = None, out = None):
+    beta, phi = _default_beta_phi(beta,phi)
+    eps = _default_eps_iso(eps)    
+    rv = rotation_vector2(phi) 
+    out = _f_iso_vec(beta,phi,rv,eps,_dummy_array24, out = out)
+    return out    
+
+def beam_mat(eps = None,beta = None,phi = None, field = "m",out = None):
+    """Computes the beam matrix.
+    
+    Broadcasting rules apply.
+    
+    Parameters
+    ----------
+    eps : float, optional
+        Isotropic dielectric tensor eigenvalue (defaults to unity)
+    beta : float, optional
+        The beta parameter of the field (defaults to 0.)
+    phi : float, optional
+        The phi parameter of the field (defaults to 0.)
+
+    Returns
+    -------
+    B : ndarray
+        The beam matrix.
+    """
+    beta, phi = _default_beta_phi(beta,phi)
+    eps = _default_eps_iso(eps)
+    rv = rotation_vector2(phi) 
+    
+    if field == "m":
+        out = _b_vec(beta,phi,rv,eps,_dummy_array44, out = out)
+    elif field == "f": 
+        out = _b_vec(beta,phi,rv,eps,_dummy_array64, out = out)
+    return out
+
+def refraction_mat(eps = None,beta = None,phi = None, invert = False, out = None):
+    if invert == False:
+        F0 = field_iso_mat(1.,0.,phi,out = out)
+        F1 =  field_iso_mat(eps,beta,phi)
+        F0i = inv(F0, out = F0)
+        return dotmm(F1,F0i, out = F0i)
+    else:
+        F0 = field_iso_mat(1.,0.,phi)
+        F1 =  field_iso_mat(eps,beta,phi, out = out)
+        F1i = inv(F1, out = F1)
+        return dotmm(F0,F1i, out = F1i)        
+    
 def fmat(beta = None, phi = None, epsv = None, epsa = None):
     deprecation("Please use field_mat instead")
     return field_mat(epsv,epsa,beta,phi)
@@ -1043,8 +1369,37 @@ def fmat2poynting(fmat, out = None):
     fmat = fmat.transpose(*axes)
     return poynting(fmat, out = out)
 
+# @nb.guvectorize([(NCDTYPE[:,:], NCDTYPE[:,:])],
+#                     "(n,n)->(n,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)       
+# def normalize_mat(fmat, out):
+#     """Normalizes columns of field matrix so that fmat2poytning of the resulted
+#     matrix returns ones
+    
+#     Parameters
+#     ----------
+#     fmat : (...,4,4) array
+#         Field matrix array.
+#     out : ndarray, optional
+#         Output array where results are written.
+#     """
+#     assert fmat.shape[0] == 4 and fmat.shape[1] == 4 
+#     for i in range(4):
+#         n = np.abs(_poynting(fmat[:,i]))**0.5
+#         if n == 0.:
+#             n = 0.
+#         else:
+#             n = 1./n
+#         out[0,i] = fmat[0,i] * n 
+#         out[1,i] = fmat[1,i] * n
+#         out[2,i] = fmat[2,i] * n
+#         out[3,i] = fmat[3,i] * n
+
+
+
+
+
 @nb.guvectorize([(NCDTYPE[:,:], NCDTYPE[:,:])],
-                    "(n,n)->(n,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)       
+                    "(m,n)->(m,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)       
 def normalize_mat(fmat, out):
     """Normalizes columns of field matrix so that fmat2poytning of the resulted
     matrix returns ones
@@ -1056,18 +1411,8 @@ def normalize_mat(fmat, out):
     out : ndarray, optional
         Output array where results are written.
     """
-    assert fmat.shape[0] == 4 and fmat.shape[1] == 4 
-    for i in range(4):
-        n = np.abs(_poynting(fmat[:,i]))**0.5
-        if n == 0.:
-            n = 0.
-        else:
-            n = 1./n
-        out[0,i] = fmat[0,i] * n 
-        out[1,i] = fmat[1,i] * n
-        out[2,i] = fmat[2,i] * n
-        out[3,i] = fmat[3,i] * n
-
+    assert fmat.shape[0] in (6,4) and fmat.shape[1] == 4 
+    _normalize_mat(fmat, out)
 
 normalize_f = normalize_mat
 
@@ -1722,8 +2067,23 @@ def _default_beam_mask(mask, k):
         mask = eigenmask((128,128), k, aspect = 1.)
     return mask
 
- 
-def beam_eig(k, epsilon = None, angles = None, normalize = True, mask = None):
+def modal_beam_mat(k, epsilon = None,  mask = None, field = "m"):
+    k = np.asarray(k)
+    mask = _default_beam_mask(mask, k)
+    eps = np.asarray(epsilon, CDTYPE) if epsilon is not None else np.asarray(1., CDTYPE)
+    
+    #add axis
+    eps = eps[...,None]
+    betas = mask2beta(mask,k)
+    phis = mask2phi(mask,k)
+    
+    if k.ndim == 0:
+        return beam_mat(eps,betas,phis, field = field)
+    else:
+        out = (beam_mat(eps,betas[i],phis[i],field = field) for i in range(len(k)))
+        return tuple(out)
+
+def modal_field_eig(k, epsilon = None, angles = None, normalize = True, mask = None):
     k = np.asarray(k)
     epsilon, angles = _default_epsv_epsa(epsilon, angles)
     mask = _default_beam_mask(mask, k)
@@ -1740,9 +2100,30 @@ def beam_eig(k, epsilon = None, angles = None, normalize = True, mask = None):
     else:
         out = (field_eig(epsilon,angles, betas[i], phis[i], normalize = normalize) for i in range(len(k0)))
         return tuple(out)
-        
-  
-def beam_transfer_mat(k, d, epsilon = None, angles = None, mask = None, with_hzez = False):
+
+def modal_field_mat(k, epsilon = None, angles = None, normalize = True, mask = None):
+    k = np.asarray(k)
+    epsilon, angles = _default_epsv_epsa(epsilon, angles)
+    mask = _default_beam_mask(mask, k)
+    
+    #add axis
+    epsilon = epsilon[...,None,:]
+    angles = angles[...,None,:]
+    
+    betas = mask2beta(mask,k)
+    phis = mask2phi(mask,k)
+    
+    if k.ndim == 0:
+        return field_mat(epsilon,angles, betas, phis, normalize = normalize)
+    else:
+        out = (field_mat(epsilon,angles, betas[i], phis[i], normalize = normalize) for i in range(len(k0)))
+        return tuple(out)
+    
+def beam_eig(k, epsilon = None, angles = None, normalize = True, mask = None):
+    deprecation("Deprecated. Use modal_field_mat instead")
+    return modal_field_eig(k, epsilon, angles, normalize, mask)
+
+def modal_transfer_mat(k, d, epsilon = None, angles = None, mask = None, with_hzez = False):
     k = np.asarray(k)
     epsilon, angles = _default_epsv_epsa(epsilon, angles)
     mask = _default_beam_mask(mask, k)
@@ -1759,6 +2140,10 @@ def beam_transfer_mat(k, d, epsilon = None, angles = None, mask = None, with_hze
     else:
         out = (transfer_mat(k[i]*d,epsilon,angles, betas[i], phis[i], with_hzez = with_hzez) for i in range(len(k0)))
         return tuple(out)
+
+def beam_transfer_mat(k, d, epsilon = None, angles = None, mask = None, with_hzez = False):
+    deprecation("Deprecated. Use modal_transfer_mat instead")
+    return modal_transfer_mat(k, d, epsilon, angles, mask, with_hzez)
 
 def transfer_beam(mat, beam, hzez = None, out = None):
     if isinstance(mat, tuple):
@@ -1854,7 +2239,6 @@ def transfer_mat(kd, epsilon = None, angles = None, beta = None, phi = None, wit
         out = fmat if out is None else out
         return dotmdm(fmat,pmat, fmati, out = out)
         
- 
 def hzez_mat(epsilon = None, angles = None, beta = None, phi = None, out = None):
     """Constructs a 2x4 matrix for conversion from field vector (Ex, Hy, Ey, Hx) 
     to Hz,Ez vector"""
