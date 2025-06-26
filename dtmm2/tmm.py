@@ -6,6 +6,9 @@ Transfer Matrix Method
 
 The implementation is based on standard formulation of 4x4 transfer matrix method.
 
+
+
+
 4x4 method
 ----------
 
@@ -83,8 +86,10 @@ Z0 = 376.73031366857
 if NUMBA_PARALLEL == False:
     prange = range
 
+#: default eigenfiled calculation method, can be any of AVAILABLE_FIELD_EIG_METHODS keys.
 FIELD_EIG_METHOD = "auto"
 
+#: maps eigenfield caluclation method string to integer
 AVAILABLE_FIELD_EIG_METHODS = {"auto" : 0,
                                "isotropic" : 1,
                                "uniaxial" : 2,
@@ -115,9 +120,12 @@ def _mode_to_int(mode):
 #-----------------------------------------------
 
 @nb.njit([(NFDTYPE,NCDTYPE[:],NCDTYPE[:,:])])                                                                
-def _auxiliary_matrix(beta,eps,Lm):
-    """Computes all elements of the auxiliary matrix of shape 4x4."""
-    #conpy in case we are reusing eps memory for output
+def _auxiliary_matrix_eps(beta,eps,Lm):
+    """Computes all elements of the auxiliary matrix of shape 4x4 for non-magnetic systems.
+    
+    Electric permitivity tensor is assumed to be symmetric, while relative permeabiliity is unity.
+    """
+    #copy in case we are reusing eps memory for output
     eps0 = eps[0]
     eps1 = eps[1]
     eps2 = eps[2]
@@ -145,20 +153,209 @@ def _auxiliary_matrix(beta,eps,Lm):
     Lm[3,1] = (-1.0*Lm[0,2])
     Lm[3,2] = beta * beta + eps5*eps5eps2m - eps1  
     Lm[3,3] = 0.  
+ 
+    
+@nb.njit([(NFDTYPE,) + (NCDTYPE,)*36 + (NCDTYPE[:,:],)])          
+def _auxiliary_matrix_m(beta,
+                        m11,m12,m13,m14,m15,m16,
+                        m21,m22,m23,m24,m25,m26,
+                        m31,m32,m33,m34,m35,m36,
+                        m41,m42,m43,m44,m45,m46,      
+                        m51,m52,m53,m54,m55,m56, 
+                        m61,m62,m63,m64,m65,m66, 
+                        Lm):
+    
+    d = m33 * m66 - m36 * m63
+    
+    a31 = (m61 * m36 - m31 * m66)/ d 
+    a32 = ((m62-beta) * m36 - m32 * m66)/d 
+    a34 = (m64 * m36 - m34 * m66) / d
+    a35 = (m65 * m36 - (m35 + beta)* m66) / d
+    a61 = (m63 * m31 - m33 * m61)/ d
+    a62 = (m63 * m32 - m33 * (m62 - beta)) / d
+    a64 = (m63 * m34 - m33 * m64) / d
+    a65 = (m63 * (m35 + beta) - m33 * m65) / d
+    
+    d21 = m11 + m13 * a31 + m16 * a61
+    d23 = m12 + m13 * a32 + m16 * a62
+    d24 = -(m14 + m13 * a34 + m16 * a64)
+    d22 = m15 + m13 * a35 + m16 * a65
+    d41 = m21 + m23* a31 + (m26 - beta) * a61
+    d43 = m22 + m23 * a32 + (m26-beta) * a62
+    d44 = -(m24 + m23*a34 + (m26 - beta) * a64)
+    d42 = m25 + m23*a35 + (m26 - beta) * a65
+    d31 = -(m41 + m43*a31 + m46 * a61)
+    d33 = -(m42 + m43 * a32 + m46* a62)
+    d34 = m44 + m43*a34 + m46 * a64
+    d32 = -(m45 + m43 * a35 + m46 * a65)
+    d11 = m51 + (m53 + beta) * a31 + m56 * a61
+    d13 = m52 + (m53 + beta) * a32 + m56 * a62
+    d14 = -(m54 + (m53 + beta) * a34 + m56 * a64)
+    d12 = m55 + (m53 + beta) * a35 + m56 * a65
+    
+    Lm[0,0] = d11
+    Lm[0,1] = d12
+    Lm[0,2] = d13
+    Lm[0,3] = -d14
+    Lm[1,0] = d21
+    Lm[1,1] = d22
+    Lm[1,2] = d23
+    Lm[1,3] = -d24
+    Lm[2,0] = d31
+    Lm[2,1] = d32
+    Lm[2,2] = d33
+    Lm[2,3] = -d34    
+    Lm[3,0] = -d41
+    Lm[3,1] = -d42
+    Lm[3,2] = -d43
+    Lm[3,3] = d44      
     
 
+@nb.njit([(NFDTYPE,NCDTYPE[:],NCDTYPE[:],NCDTYPE[:,:])])                                                                
+def _auxiliary_matrix_eps_mu(beta,eps, mu, Lm):
+    """Computes all elements of the auxiliary matrix of shape 4x4 for magnetic systems.
+    
+    The permitivity and permeability tensors are both assumed to be symmetric.
+    
+    See [Berreman] for details.
+    """
+    m11 = eps[0] #eps11
+    m22 = eps[1] #eps22
+    m33 = eps[2] #eps33
+    m12 = eps[3] #eps12
+    m21 = eps[3] #eps is symmetric
+    m13 = eps[4] #eps13
+    m31 = eps[4] #eps is symmetric
+    m23 = eps[5] #eps23
+    m32 = eps[5] #eps is symmetric
+    
+     
+    m44 = mu[0] #mu11
+    m55 = mu[1] #mu22
+    m66 = mu[2] #mu33
+    m45 = mu[3] #mu12
+    m54 = mu[3] #mu is symmetric
+    m46 = mu[4] #mu13
+    m64 = mu[4] #mu is symmetric
+    m56 = mu[5] #mu23
+    m65 = mu[5] #mu is symmetric
+    
+    m41 = 0
+    m51 = 0
+    m61 = 0
+    m42 = 0
+    m52 = 0
+    m62 = 0    
+    m43 = 0
+    m53 = 0
+    m63 = 0  
+
+    m14 = 0
+    m15 = 0
+    m16 = 0
+    m24 = 0
+    m25 = 0
+    m26 = 0    
+    m34 = 0
+    m35 = 0
+    m36 = 0  
+    
+    _auxiliary_matrix_m(beta,
+                            m11,m12,m13,m14,m15,m16,
+                            m21,m22,m23,m24,m25,m26,
+                            m31,m32,m33,m34,m35,m36,
+                            m41,m42,m43,m44,m45,m46,      
+                            m51,m52,m53,m54,m55,m56, 
+                            m61,m62,m63,m64,m65,m66, 
+                            Lm)
+    
+@nb.njit([(NFDTYPE,NCDTYPE[:,:],NCDTYPE[:,:],NCDTYPE[:,:],NCDTYPE[:,:],NCDTYPE[:,:])])                                                                
+def _auxiliary_matrix_general(beta,eps, mu, rho, rhop, Lm):
+    """Computes all elements of the auxiliary matrix of shape 4x4 for optically active systems
+
+    See [Berreman] for details.
+    """
+    m11 = eps[0,0]
+    m22 = eps[1,1]
+    m33 = eps[2,2] 
+    m12 = eps[0,1]
+    m21 = eps[1,0] 
+    m13 = eps[0,2] 
+    m31 = eps[2,0] 
+    m23 = eps[1,2] 
+    m32 = eps[2,1] 
+    
+    m44 = mu[0,0]
+    m55 = mu[1,1]
+    m66 = mu[2,2]
+    m45 = mu[0,1]
+    m54 = mu[1,0]
+    m46 = mu[0,2]
+    m64 = mu[2,0]
+    m56 = mu[1,2]
+    m65 = mu[2,1]
+    
+    m41 = rho[0,0]
+    m51 = rho[1,0]
+    m61 = rho[2,0]
+    m42 = rho[0,1]
+    m52 = rho[1,1]
+    m62 = rho[2,1]    
+    m43 = rho[0,2]
+    m53 = rho[1,2]
+    m63 = rho[2,2]  
+
+    m14 = rhop[0,0]
+    m15 = rhop[0,1]
+    m16 = rhop[0,2]
+    m24 = rhop[1,0]
+    m25 = rhop[1,1]
+    m26 = rhop[1,2]    
+    m34 = rhop[2,0]
+    m35 = rhop[2,1]
+    m36 = rhop[2,2]  
+    
+    _auxiliary_matrix_m(beta,
+                            m11,m12,m13,m14,m15,m16,
+                            m21,m22,m23,m24,m25,m26,
+                            m31,m32,m33,m34,m35,m36,
+                            m41,m42,m43,m44,m45,m46,      
+                            m51,m52,m53,m54,m55,m56, 
+                            m61,m62,m63,m64,m65,m66, 
+                            Lm)
+    
 @nb.guvectorize([(NFDTYPE[:],NCDTYPE[:],NCDTYPE[:],NCDTYPE[:,:])],
                  "(),(k),(n)->(n,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)                                                               
-def _auxiliary_matrix_vec(beta,eps,dummy,Lm):
+def _auxiliary_matrix_eps_vec(beta,eps,dummy,Lm):
     """Computes all elements of the auxiliary matrix of shape 4x4."""
     assert len(eps) == 6
-    _auxiliary_matrix(beta[0],eps,Lm)
+    _auxiliary_matrix_eps(beta[0],eps,Lm)
     
-def auxiliary_matrix(beta = None, epsilon = None, out = None):
+@nb.guvectorize([(NFDTYPE[:],NCDTYPE[:],NCDTYPE[:],NCDTYPE[:],NCDTYPE[:,:])],
+                 "(),(k),(k),(n)->(n,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)                                                               
+def _auxiliary_matrix_eps_mu_vec(beta,eps,mu,dummy,Lm):
+    """Computes all elements of the auxiliary matrix of shape 4x4."""
+    assert len(eps) == 6
+    _auxiliary_matrix_eps_mu(beta[0],eps,mu,Lm)
+    
+@nb.guvectorize([(NFDTYPE[:],NCDTYPE[:,:],NCDTYPE[:,:],NCDTYPE[:,:],NCDTYPE[:,:],NCDTYPE[:],NCDTYPE[:,:])],
+                 "(),(k,k),(k,k),(k,k),(k,k),(n)->(n,n)", target = NUMBA_TARGET, cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)                                                               
+def _auxiliary_matrix_general_vec(beta,eps,mu,rho,rhop,dummy,Lm):
+    """Computes all elements of the auxiliary matrix of shape 4x4."""
+    assert len(eps) == 4
+    _auxiliary_matrix_general(beta[0],eps,mu,rho,rhop,Lm)
+    
+def auxiliary_matrix(beta = None, epsilon = None, mu = None, out = None):
     """Computes auxiliary matrix in refraction plane"""
     beta, phi = _default_beta_phi(beta,None)
     epsilon = _default_epsilon(epsilon)
-    return _auxiliary_matrix_vec(beta,epsilon,_dummy_array,out)
+    
+    if mu is None:
+        # simplified (non-magnetic) system
+        return _auxiliary_matrix_eps_vec(beta,epsilon,_dummy_array,out)
+    else:
+        mu = _default_epsilon(mu)
+        return _auxiliary_matrix_eps_mu_vec(beta,epsilon,mu,_dummy_array,out)
   
 # @nb.njit([(NFDTYPE,NCDTYPE,NCDTYPE[:,:])], cache = NUMBA_CACHE, fastmath = NUMBA_FASTMATH)
 # def _f_iso(beta,eps,F):
@@ -501,7 +698,7 @@ def _alphaf_vec(case,beta,phi,rv,epsv,epsa,dummy,alpha,F):
         else: #CASE 0, we must rotate full 6-component tensor
             assert len(epsv) >= 6
             _rotate_tensor(R,epsv,eps)
-        _auxiliary_matrix(beta[0],eps,F) #calculate Lm matrix and put it to F
+        _auxiliary_matrix_eps(beta[0],eps,F) #calculate Lm matrix and put it to F
         alpha0,F0 = np.linalg.eig(F)
         _copy_sorted(alpha0,F0,alpha,F)#copy data and sort it
         _dotr2m(rv,F,F)
@@ -575,7 +772,7 @@ def _alphaf6_vec(case,beta,phi,rv,epsv,epsa,dummy,alpha,F):
             e0 = -eps[4]/eps[2] #eps_zx/eps_zz
             e1 = -beta[0]/eps[2] #beta/eps_zz
             e2 = -eps[5]/eps[2] #eps_zy/eps_zz
-        _auxiliary_matrix(beta[0],eps,F) #calculate Lm matrix and put it to F
+        _auxiliary_matrix_eps(beta[0],eps,F) #calculate Lm matrix and put it to F
         alpha0,F0 = np.linalg.eig(F[0:4])
         _copy_sorted(alpha0,F0,alpha,F[0:4])#copy data and sort it
         
@@ -722,7 +919,7 @@ def _alphafhe_vec(case,beta,phi,rv,epsv,epsa,dummy,alpha,F,HE):
         e0 = -eps[4]/eps[2] #eps_zx/eps_zz
         e1 = -beta[0]/eps[2] #beta/eps_zz
         e2 = -eps[5]/eps[2] #eps_zy/eps_zz
-        _auxiliary_matrix(beta[0],eps,F) #calculate Lm matrix and put it to F
+        _auxiliary_matrix_eps(beta[0],eps,F) #calculate Lm matrix and put it to F
         alpha0,F0 = np.linalg.eig(F[0:4])
         _copy_sorted(alpha0,F0,alpha,F)#copy data and sort it
     
@@ -2062,20 +2259,20 @@ class TransferMatrix1D():
  
 from dtmm2.wave import mask2beta, mask2phi, eigenmask, k0
 
-def _default_beam_mask(mask, k):
+def _default_beam_mask(mask, k, aspect = 1):
     if mask is None:
-        mask = eigenmask((128,128), k, aspect = 1.)
+        mask = eigenmask((128,128), k, aspect = aspect)
     return mask
 
-def modal_beam_mat(k, epsilon = None,  mask = None, field = "m"):
+def modal_beam_mat(k, epsilon = None,  mask = None, field = "m", aspect = 1.):
     k = np.asarray(k)
-    mask = _default_beam_mask(mask, k)
+    mask = _default_beam_mask(mask, k, aspect)
     eps = np.asarray(epsilon, CDTYPE) if epsilon is not None else np.asarray(1., CDTYPE)
     
     #add axis
     eps = eps[...,None]
-    betas = mask2beta(mask,k)
-    phis = mask2phi(mask,k)
+    betas = mask2beta(mask,k,aspect)
+    phis = mask2phi(mask,k,aspect)
     
     if k.ndim == 0:
         return beam_mat(eps,betas,phis, field = field)
